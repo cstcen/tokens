@@ -78,7 +78,7 @@ Response:
 If your target repo is `E:\Code\tokens`, you can:
 
 - Copy this `authjwe` folder into `E:\Code\tokens` (or merge `tokens/` into your package path of choice)
-- Update `module` path in `go.mod` to match your repository, e.g. `module github.com/yourorg/tokens`
+- Update `module` path in `go.mod` to match your repository, e.g. `module github.com/cstcen/tokens`
 - Adjust imports if you move the package path
 - Run:
 

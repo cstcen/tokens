@@ -12,7 +12,7 @@ import (
 	jose "github.com/go-jose/go-jose/v3"
 	redis "github.com/redis/go-redis/v9"
 
-	"github.com/yourorg/tokens/tokens"
+	"github.com/cstcen/tokens/tokens"
 )
 
 type issueReq struct {

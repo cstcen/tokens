@@ -1,4 +1,4 @@
-module github.com/yourorg/tokens
+module github.com/cstcen/tokens
 
 go 1.22
 
