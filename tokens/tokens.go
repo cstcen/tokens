@@ -51,11 +51,31 @@ func IssueAccessAndRefreshJWE(
 	accessTTL, refreshTTL time.Duration,
 	scope []string,
 ) (accessJWE, refreshJWE string, err error) {
+	accessJWE, refreshJWE, _, _, err = IssueAccessAndRefreshJWEWithClaims(
+		signKid, signPriv, encKid, encPubKey, algs,
+		iss, aud, sub, uid, deviceID, clientID,
+		accessTTL, refreshTTL, scope,
+	)
+	return
+}
+
+// IssueAccessAndRefreshJWEWithClaims issues tokens and also returns the constructed claims
+// to allow callers to persist/cache without re-decrypting.
+func IssueAccessAndRefreshJWEWithClaims(
+	signKid string,
+	signPriv *ecdsa.PrivateKey,
+	encKid string,
+	encPubKey interface{},
+	algs KeyAlgs,
+	iss, aud, sub, uid, deviceID, clientID string,
+	accessTTL, refreshTTL time.Duration,
+	scope []string,
+) (accessJWE, refreshJWE string, accessClaims AccessCustomClaims, refreshClaims RefreshCustomClaims, err error) {
 	now := time.Now()
 
 	// ---- Access claims -> JWS -> JWE ----
 	accessJti := uuid.NewString()
-	accessClaims := AccessCustomClaims{
+	accessClaims = AccessCustomClaims{
 		Scope:    scope,
 		DeviceID: deviceID,
 		ClientID: clientID,
@@ -71,18 +91,18 @@ func IssueAccessAndRefreshJWE(
 	}
 	innerAccessJWS, err := signJWT(signPriv, signKid, algs.SignAlg, accessClaims)
 	if err != nil {
-		return "", "", err
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
 	accessJWE, err = encryptAsJWE(innerAccessJWS, encKid, encPubKey, algs.KeyMgmtAlg, algs.ContentEncryption)
 	if err != nil {
-		return "", "", err
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
 
 	// ---- Refresh claims -> JWS -> JWE ----
 	rid := uuid.NewString()
 	fid := uuid.NewString()
 	refreshJti := uuid.NewString()
-	refreshClaims := RefreshCustomClaims{
+	refreshClaims = RefreshCustomClaims{
 		RID:      rid,
 		FID:      fid,
 		UID:      uid,
@@ -101,12 +121,12 @@ func IssueAccessAndRefreshJWE(
 	}
 	innerRefreshJWS, err := signJWT(signPriv, signKid, algs.SignAlg, refreshClaims)
 	if err != nil {
-		return "", "", err
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
 	refreshJWE, err = encryptAsJWE(innerRefreshJWS, encKid, encPubKey, algs.KeyMgmtAlg, algs.ContentEncryption)
 	if err != nil {
-		return "", "", err
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
 
-	return accessJWE, refreshJWE, nil
+	return accessJWE, refreshJWE, accessClaims, refreshClaims, nil
 }

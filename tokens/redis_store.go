@@ -19,6 +19,9 @@ type TokenStore interface {
 	GetAccess(ctx context.Context, jti string) (AccessCustomClaims, bool, error)
 	GetRefresh(ctx context.Context, rid string) (RefreshCustomClaims, bool, error)
 
+	// Family mapping helpers: current RID for a given FID
+	GetFID(ctx context.Context, fid string) (string, bool, error)
+
 	// Revoke deletes stored entries and optionally marks identifiers as revoked.
 	RevokeAccess(ctx context.Context, jti string, ttl time.Duration) error
 	RevokeRefresh(ctx context.Context, rid string, ttl time.Duration) error
@@ -108,6 +111,17 @@ func (s *RedisTokenStore) GetRefresh(ctx context.Context, rid string) (RefreshCu
 		return out, false, err
 	}
 	return out, true, nil
+}
+
+func (s *RedisTokenStore) GetFID(ctx context.Context, fid string) (string, bool, error) {
+	res, err := s.rdb.Get(ctx, s.key("fid:", fid)).Result()
+	if err == redis.Nil {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return res, true, nil
 }
 
 // RevokeAccess deletes the stored access and writes a short-lived tombstone to prevent token replay when storage is eventually consistent.
