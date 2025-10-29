@@ -87,6 +87,13 @@ func WithSameDeviceHandlerFunc(h SameDeviceHandlerFunc) IssueOption {
 	}
 }
 
+// WithResultSink allows callers to retrieve detailed same-device handling outcomes.
+func WithResultSink(res *IssueResult) IssueOption {
+	return func(p *IssueAndStoreParams) {
+		p.Opts.ResultSink = res
+	}
+}
+
 // WithDeviceIndex provides a DeviceIndexStore for same-device policy enforcement.
 func WithDeviceIndex(dstore DeviceIndexStore) IssueOption {
 	return func(p *IssueAndStoreParams) {

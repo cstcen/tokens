@@ -46,6 +46,32 @@ type SameDeviceContext struct {
 // SameDeviceHandlerFunc is a friendlier handler signature using SameDeviceContext.
 type SameDeviceHandlerFunc func(ctx context.Context, c SameDeviceContext) error
 
+// SameDeviceOutcome indicates which path was taken when handling an existing same-device session.
+type SameDeviceOutcome int
+
+const (
+	SameDeviceOutcomeUnknown SameDeviceOutcome = iota
+	// No same-device check performed (missing dstore/uid/device)
+	SameDeviceOutcomeNoCheck
+	// Checked but no existing session for this device
+	SameDeviceOutcomeNoExisting
+	// Policy allow with existing session present
+	SameDeviceOutcomeAllowedExisting
+	// Policy reject with existing session present
+	SameDeviceOutcomeRejected
+	// Policy single-active with existing session (attempted to revoke previous)
+	SameDeviceOutcomeSingleActive
+)
+
+// IssueResult captures side-effects and outcomes during issuing.
+type IssueResult struct {
+	SameDeviceChecked bool
+	SameDeviceExisted bool
+	SameDeviceOutcome SameDeviceOutcome
+	OldRID            string
+	NewRID            string
+}
+
 // HandleSameDevice encapsulates the business handling when a same-device session already exists.
 // For policies:
 // - Allow: no-op
@@ -197,6 +223,8 @@ type IssueOptions struct {
 	Handler SameDeviceHandler
 	// Preferred handler using context struct
 	HandlerFunc SameDeviceHandlerFunc
+	// Optional sink to receive same-device outcome information
+	ResultSink *IssueResult
 }
 
 // IssueAndStoreParams wraps all parameters to reduce function argument count.
@@ -232,6 +260,14 @@ func IssueAndStore(p IssueAndStoreParams) (
 		return
 	}
 
+	// Pre-fill result with new RID
+	if p.Opts.ResultSink != nil {
+		p.Opts.ResultSink.NewRID = refreshClaims.RID
+		p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeUnknown
+		p.Opts.ResultSink.SameDeviceChecked = false
+		p.Opts.ResultSink.SameDeviceExisted = false
+		p.Opts.ResultSink.OldRID = ""
+	}
 	// Policy enforcement
 	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {
 		if oldRID, exists, derr := p.DStore.GetDeviceRID(ctx, p.In.UID, p.In.DeviceID); derr != nil {
@@ -239,6 +275,11 @@ func IssueAndStore(p IssueAndStoreParams) (
 			return
 		} else if exists && oldRID != "" {
 			// Prefer new-style handler
+			if p.Opts.ResultSink != nil {
+				p.Opts.ResultSink.SameDeviceChecked = true
+				p.Opts.ResultSink.SameDeviceExisted = true
+				p.Opts.ResultSink.OldRID = oldRID
+			}
 			if p.Opts.HandlerFunc != nil {
 				c := SameDeviceContext{
 					UID:        p.In.UID,
@@ -254,20 +295,42 @@ func IssueAndStore(p IssueAndStoreParams) (
 					return
 				}
 			} else if p.Opts.Handler != nil {
+				// Outcome is user-defined; leave as Unknown unless handler sets via closure
 				if herr := p.Opts.Handler(ctx, p.Store, p.DStore, p.In.UID, p.In.DeviceID, oldRID, refreshClaims, p.Opts.Policy); herr != nil {
 					err = herr
 					return
 				}
 			} else {
+				// Outcome is user-defined; leave as Unknown unless caller set via sink
 				if herr := p.Opts.Policy.HandleSameDevice(ctx, p.Store, p.DStore, p.In.UID, p.In.DeviceID, oldRID, refreshClaims); herr != nil {
+					// Default behavior via policy
+					if p.Opts.ResultSink != nil {
+						switch p.Opts.Policy {
+						case DevicePolicyRejectIfSameDeviceExists:
+							p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeRejected
+						case DevicePolicySingleActivePerDevice:
+							p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeSingleActive
+						default:
+							p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeAllowedExisting
+						}
+					}
 					err = herr
 					return
 				}
 			}
 		}
 	}
+	if p.Opts.ResultSink != nil {
+		p.Opts.ResultSink.SameDeviceChecked = true
+		p.Opts.ResultSink.SameDeviceExisted = false
+		p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeNoExisting
+	}
 
 	// Persist
+	if p.Opts.ResultSink != nil {
+		p.Opts.ResultSink.SameDeviceChecked = false
+		p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeNoCheck
+	}
 	aTTL := ttlFromExpiry(accessClaims.Claims.Expiry.Time(), 0)
 	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
 	if err = p.Store.SaveAccessRefreshAtomic(ctx,
