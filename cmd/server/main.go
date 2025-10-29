@@ -132,7 +132,40 @@ func main() {
 			req.RefreshTTLDays = 14
 		}
 
-		access, refresh, acClaims, rcClaims, err := tokens.IssueAccessAndRefreshJWEWithClaims(
+		// Use new Functional Options API when Redis is enabled; otherwise fallback to stateless issue
+		if store != nil {
+			// If store also supports device index, provide it (policy default allow here)
+			opts := []tokens.IssueOption{
+				tokens.WithKeys(signKid, signPriv, encKid, &encPriv.PublicKey, algs),
+				tokens.WithAudience(req.Iss, req.Aud),
+				tokens.WithSubject(req.UID, req.Sub),
+				tokens.WithClient(req.ClientID),
+				tokens.WithDevice(req.DeviceID),
+				tokens.WithScope(req.Scope...),
+				tokens.WithTTL(time.Duration(req.AccessTTLMinutes)*time.Minute, time.Duration(req.RefreshTTLDays)*24*time.Hour),
+			}
+			if rs, ok := store.(tokens.DeviceIndexStore); ok {
+				opts = append(opts, tokens.WithDeviceIndex(rs))
+			}
+			access, refresh, acClaims, rcClaims, err := tokens.Issue(r.Context(), store, opts...)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			// Optional: warm caches
+			if acClaims.Claims.Expiry != nil {
+				_ = store.CacheAccessClaims(r.Context(), access, acClaims, time.Until(acClaims.Claims.Expiry.Time()))
+			}
+			if rcClaims.Claims.Expiry != nil {
+				_ = store.CacheRefreshClaims(r.Context(), refresh, rcClaims, time.Until(rcClaims.Claims.Expiry.Time()))
+			}
+			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
+			return
+		}
+
+		// Fallback: issue without persistence when Redis disabled
+		access, refresh, _, _, err := tokens.IssueAccessAndRefreshJWEWithClaims(
 			signKid, signPriv,
 			encKid, &encPriv.PublicKey,
 			algs,
@@ -145,20 +178,6 @@ func main() {
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
-		}
-		// Persist and warm caches if Redis is enabled
-		if store != nil {
-			ctx := r.Context()
-			if acClaims.Claims.Expiry != nil && rcClaims.Claims.Expiry != nil {
-				aTTL := time.Until(acClaims.Claims.Expiry.Time())
-				rTTL := time.Until(rcClaims.Claims.Expiry.Time())
-				_ = store.SaveAccessRefreshAtomic(ctx,
-					acClaims.Claims.ID, acClaims, aTTL,
-					rcClaims.RID, rcClaims.FID, rcClaims, rTTL,
-				)
-				_ = store.CacheAccessClaims(ctx, access, acClaims, aTTL)
-				_ = store.CacheRefreshClaims(ctx, refresh, rcClaims, rTTL)
-			}
 		}
 		_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
 	})
@@ -193,23 +212,37 @@ func main() {
 			pol = tokens.DevicePolicySingleActivePerDevice
 		}
 
-		// Require Redis for non-allow policies (needs device index)
-		if pol != tokens.DevicePolicyAllowSameDevice && store == nil {
+		// If Redis available, use new Issue API with policy; otherwise, allow-only fallback
+		if store != nil {
+			opts := []tokens.IssueOption{
+				tokens.WithKeys(signKid, signPriv, encKid, &encPriv.PublicKey, algs),
+				tokens.WithAudience(req.Iss, req.Aud),
+				tokens.WithSubject(req.UID, req.Sub),
+				tokens.WithClient(req.ClientID),
+				tokens.WithDevice(req.DeviceID),
+				tokens.WithScope(req.Scope...),
+				tokens.WithTTL(time.Duration(req.AccessTTLMinutes)*time.Minute, time.Duration(req.RefreshTTLDays)*24*time.Hour),
+				tokens.WithPolicy(pol),
+			}
+			if rs, ok := store.(tokens.DeviceIndexStore); ok {
+				opts = append(opts, tokens.WithDeviceIndex(rs))
+			}
+			access, refresh, _, _, err := tokens.Issue(r.Context(), store, opts...)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
+			return
+		}
+		if pol != tokens.DevicePolicyAllowSameDevice {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "policy requires redis store"})
 			return
 		}
-
-		// Use store as both TokenStore and DeviceIndexStore when available
-		var dstore tokens.DeviceIndexStore
-		if rs, ok := store.(tokens.DeviceIndexStore); ok {
-			dstore = rs
-		}
-
-		access, refresh, _, _, err := tokens.IssueAndStoreWithPolicy(
-			r.Context(),
-			store,
-			dstore,
+		// Fallback stateless issue for allow policy
+		access, refresh, _, _, err := tokens.IssueAccessAndRefreshJWEWithClaims(
 			signKid, signPriv,
 			encKid, &encPriv.PublicKey,
 			algs,
@@ -217,7 +250,6 @@ func main() {
 			time.Duration(req.AccessTTLMinutes)*time.Minute,
 			time.Duration(req.RefreshTTLDays)*24*time.Hour,
 			req.Scope,
-			pol,
 		)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)

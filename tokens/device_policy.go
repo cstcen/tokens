@@ -32,6 +32,20 @@ type SameDeviceHandler func(
 	policy DevicePolicy,
 ) error
 
+// SameDeviceContext bundles information for custom handlers in a single struct.
+type SameDeviceContext struct {
+	UID        string
+	DeviceID   string
+	OldRID     string
+	NewRefresh RefreshCustomClaims
+	Policy     DevicePolicy
+	Store      TokenStore
+	DStore     DeviceIndexStore
+}
+
+// SameDeviceHandlerFunc is a friendlier handler signature using SameDeviceContext.
+type SameDeviceHandlerFunc func(ctx context.Context, c SameDeviceContext) error
+
 // HandleSameDevice encapsulates the business handling when a same-device session already exists.
 // For policies:
 // - Allow: no-op
@@ -154,6 +168,117 @@ func IssueAndStoreWithPolicyWithHandler(
 		_ = dstore.SetDeviceRID(ctx, uid, deviceID, refreshClaims.RID, rTTL)
 	}
 
+	return
+}
+
+// IssueInputs groups the inputs required to issue a pair of tokens.
+type IssueInputs struct {
+	SignKid   string
+	SignPriv  *ecdsa.PrivateKey
+	EncKid    string
+	EncPubKey interface{}
+	Algs      KeyAlgs
+
+	Iss        string
+	Aud        string
+	Sub        string
+	UID        string
+	DeviceID   string
+	ClientID   string
+	AccessTTL  time.Duration
+	RefreshTTL time.Duration
+	Scope      []string
+}
+
+// IssueOptions configures policy and optional handlers.
+type IssueOptions struct {
+	Policy DevicePolicy
+	// Back-compat classic handler
+	Handler SameDeviceHandler
+	// Preferred handler using context struct
+	HandlerFunc SameDeviceHandlerFunc
+}
+
+// IssueAndStoreParams wraps all parameters to reduce function argument count.
+type IssueAndStoreParams struct {
+	Ctx    context.Context
+	Store  TokenStore
+	DStore DeviceIndexStore
+	In     IssueInputs
+	Opts   IssueOptions
+}
+
+// IssueAndStore issues and persists tokens according to provided params, enforcing device policy.
+func IssueAndStore(p IssueAndStoreParams) (
+	accessJWE, refreshJWE string,
+	accessClaims AccessCustomClaims,
+	refreshClaims RefreshCustomClaims,
+	err error,
+) {
+	ctx := p.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Issue first
+	accessJWE, refreshJWE, accessClaims, refreshClaims, err = IssueAccessAndRefreshJWEWithClaims(
+		p.In.SignKid, p.In.SignPriv,
+		p.In.EncKid, p.In.EncPubKey,
+		p.In.Algs,
+		p.In.Iss, p.In.Aud, p.In.Sub, p.In.UID, p.In.DeviceID, p.In.ClientID,
+		p.In.AccessTTL, p.In.RefreshTTL,
+		p.In.Scope,
+	)
+	if err != nil {
+		return
+	}
+
+	// Policy enforcement
+	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {
+		if oldRID, exists, derr := p.DStore.GetDeviceRID(ctx, p.In.UID, p.In.DeviceID); derr != nil {
+			err = derr
+			return
+		} else if exists && oldRID != "" {
+			// Prefer new-style handler
+			if p.Opts.HandlerFunc != nil {
+				c := SameDeviceContext{
+					UID:        p.In.UID,
+					DeviceID:   p.In.DeviceID,
+					OldRID:     oldRID,
+					NewRefresh: refreshClaims,
+					Policy:     p.Opts.Policy,
+					Store:      p.Store,
+					DStore:     p.DStore,
+				}
+				if herr := p.Opts.HandlerFunc(ctx, c); herr != nil {
+					err = herr
+					return
+				}
+			} else if p.Opts.Handler != nil {
+				if herr := p.Opts.Handler(ctx, p.Store, p.DStore, p.In.UID, p.In.DeviceID, oldRID, refreshClaims, p.Opts.Policy); herr != nil {
+					err = herr
+					return
+				}
+			} else {
+				if herr := p.Opts.Policy.HandleSameDevice(ctx, p.Store, p.DStore, p.In.UID, p.In.DeviceID, oldRID, refreshClaims); herr != nil {
+					err = herr
+					return
+				}
+			}
+		}
+	}
+
+	// Persist
+	aTTL := ttlFromExpiry(accessClaims.Claims.Expiry.Time(), 0)
+	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
+	if err = p.Store.SaveAccessRefreshAtomic(ctx,
+		accessClaims.Claims.ID, accessClaims, aTTL,
+		refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL,
+	); err != nil {
+		return
+	}
+	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {
+		_ = p.DStore.SetDeviceRID(ctx, p.In.UID, p.In.DeviceID, refreshClaims.RID, rTTL)
+	}
 	return
 }
 
