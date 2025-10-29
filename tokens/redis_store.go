@@ -54,6 +54,7 @@ type TokenStore interface {
 //	p+"rev:r:"+rid   -> "1"                        EX=ttl
 //	p+"ac-cache:"+H  -> JSON(AccessCustomClaims)   EX=ttl (parsed token cache)
 //	p+"rc-cache:"+H  -> JSON(RefreshCustomClaims)  EX=ttl
+//	p+"uxd:"+uid+"|"+deviceID -> rid            EX=ttl (current session mapping per user+device)
 type RedisTokenStore struct {
 	rdb    redis.UniversalClient
 	prefix string
@@ -253,6 +254,43 @@ func (s *RedisTokenStore) GetCachedRefresh(ctx context.Context, token string) (R
 		return out, false, err
 	}
 	return out, true, nil
+}
+
+// ------ Optional device index helpers (UID + DeviceID -> current RID) ------
+
+// DeviceIndexStore exposes per-user, per-device session mapping helpers.
+// Implemented by RedisTokenStore below.
+type DeviceIndexStore interface {
+	GetDeviceRID(ctx context.Context, uid, deviceID string) (string, bool, error)
+	SetDeviceRID(ctx context.Context, uid, deviceID, rid string, ttl time.Duration) error
+	DelDeviceRID(ctx context.Context, uid, deviceID string) error
+}
+
+func (s *RedisTokenStore) deviceKey(uid, deviceID string) string {
+	// Key: prefix + "uxd:" + uid + "|" + deviceID
+	return s.key("uxd:", uid, "|", deviceID)
+}
+
+// GetDeviceRID returns the currently recorded RID for a given user+device.
+func (s *RedisTokenStore) GetDeviceRID(ctx context.Context, uid, deviceID string) (string, bool, error) {
+	res, err := s.rdb.Get(ctx, s.deviceKey(uid, deviceID)).Result()
+	if err == redis.Nil {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return res, true, nil
+}
+
+// SetDeviceRID sets/updates the device mapping with a TTL (typically refresh TTL).
+func (s *RedisTokenStore) SetDeviceRID(ctx context.Context, uid, deviceID, rid string, ttl time.Duration) error {
+	return s.rdb.Set(ctx, s.deviceKey(uid, deviceID), rid, ttl).Err()
+}
+
+// DelDeviceRID removes the device mapping.
+func (s *RedisTokenStore) DelDeviceRID(ctx context.Context, uid, deviceID string) error {
+	return s.rdb.Del(ctx, s.deviceKey(uid, deviceID)).Err()
 }
 
 // Helper: TTL remaining from claims' exp (clamped to >=0 and at most maxTTL if >0)

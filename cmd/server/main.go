@@ -32,6 +32,23 @@ type issueResp struct {
 	RefreshJWE string `json:"refresh_jwe"`
 }
 
+// Policy issue request
+type issuePolicyReq struct {
+	issueReq
+	// Policy: "allow" (default) | "reject" | "single"
+	Policy string `json:"policy"`
+}
+
+type deviceStatusReq struct {
+	UID      string `json:"uid"`
+	DeviceID string `json:"device_id"`
+}
+
+type deviceStatusResp struct {
+	Exists bool   `json:"exists"`
+	Error  string `json:"error,omitempty"`
+}
+
 type verifyReq struct {
 	Type  string `json:"type"` // "access" | "refresh"
 	Token string `json:"token"`
@@ -146,6 +163,94 @@ func main() {
 		_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
 	})
 
+	// Minimal example: issue with same-device policy
+	// Body: { ...issueReq fields..., "policy":"allow|reject|single" }
+	http.HandleFunc("/issue_policy", func(w http.ResponseWriter, r *http.Request) {
+		var req issuePolicyReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Iss == "" {
+			req.Iss = "https://auth.local"
+		}
+		if req.Aud == "" {
+			req.Aud = "api://local"
+		}
+		if req.Sub == "" {
+			req.Sub = req.UID
+		}
+		if req.AccessTTLMinutes <= 0 {
+			req.AccessTTLMinutes = 10
+		}
+		if req.RefreshTTLDays <= 0 {
+			req.RefreshTTLDays = 14
+		}
+
+		// Map string policy to enum
+		pol := tokens.DevicePolicyAllowSameDevice
+		switch req.Policy {
+		case "reject":
+			pol = tokens.DevicePolicyRejectIfSameDeviceExists
+		case "single":
+			pol = tokens.DevicePolicySingleActivePerDevice
+		}
+
+		// Require Redis for non-allow policies (needs device index)
+		if pol != tokens.DevicePolicyAllowSameDevice && store == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "policy requires redis store"})
+			return
+		}
+
+		// Use store as both TokenStore and DeviceIndexStore when available
+		var dstore tokens.DeviceIndexStore
+		if rs, ok := store.(tokens.DeviceIndexStore); ok {
+			dstore = rs
+		}
+
+		access, refresh, _, _, err := tokens.IssueAndStoreWithPolicy(
+			r.Context(),
+			store,
+			dstore,
+			signKid, signPriv,
+			encKid, &encPriv.PublicKey,
+			algs,
+			req.Iss, req.Aud, req.Sub, req.UID, req.DeviceID, req.ClientID,
+			time.Duration(req.AccessTTLMinutes)*time.Minute,
+			time.Duration(req.RefreshTTLDays)*24*time.Hour,
+			req.Scope,
+			pol,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
+	})
+
+	// Query if same-device already logged in (requires Redis)
+	http.HandleFunc("/device_status", func(w http.ResponseWriter, r *http.Request) {
+		if store == nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(deviceStatusResp{Error: "redis not enabled"})
+			return
+		}
+		rs, ok := store.(tokens.DeviceIndexStore)
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(deviceStatusResp{Error: "device index not supported"})
+			return
+		}
+		var req deviceStatusReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		exists, err := tokens.IsSameDeviceLoggedIn(r.Context(), rs, req.UID, req.DeviceID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(deviceStatusResp{Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(deviceStatusResp{Exists: exists})
+	})
+
 	http.HandleFunc("/verify", func(w http.ResponseWriter, r *http.Request) {
 		var req verifyReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -211,6 +316,20 @@ func main() {
 		Aud   string `json:"aud"`
 	}
 	type refreshResp struct {
+		AccessJWE  string `json:"access_jwe"`
+		RefreshJWE string `json:"refresh_jwe"`
+	}
+
+	// Refresh with device policy (minimal): policy = "allow" (default) | "single"
+	type refreshPolicyReq struct {
+		Token            string `json:"token"`
+		Iss              string `json:"iss"`
+		Aud              string `json:"aud"`
+		Policy           string `json:"policy"`
+		AccessTTLMinutes int    `json:"access_ttl_minutes"`
+		RefreshTTLDays   int    `json:"refresh_ttl_days"`
+	}
+	type refreshPolicyResp struct {
 		AccessJWE  string `json:"access_jwe"`
 		RefreshJWE string `json:"refresh_jwe"`
 	}
@@ -298,6 +417,110 @@ func main() {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(refreshResp{AccessJWE: acJWE, RefreshJWE: rfJWE})
+	})
+
+	http.HandleFunc("/refresh_policy", func(w http.ResponseWriter, r *http.Request) {
+		var req refreshPolicyReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Iss == "" {
+			req.Iss = "https://auth.local"
+		}
+		if req.Aud == "" {
+			req.Aud = "api://local"
+		}
+		if req.AccessTTLMinutes <= 0 {
+			req.AccessTTLMinutes = 10
+		}
+		if req.RefreshTTLDays <= 0 {
+			req.RefreshTTLDays = 14
+		}
+
+		// Decrypt + verify refresh
+		rc, err := tokens.DecryptAndVerifyRefresh(req.Token, encPriv, findSigKeyByKID, req.Iss, req.Aud)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		// Optional state checks when Redis enabled
+		var dstore tokens.DeviceIndexStore
+		if store != nil {
+			if _, found, _ := store.GetRefresh(r.Context(), rc.RID); !found {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "revoked or not found"})
+				return
+			}
+			if cur, ok, _ := store.GetFID(r.Context(), rc.FID); ok && cur != rc.RID {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "refresh reuse detected"})
+				return
+			}
+			if rs, ok := store.(tokens.DeviceIndexStore); ok {
+				dstore = rs
+			}
+		}
+
+		// Enforce device policy (minimal): if policy==single, ensure rc is current for device
+		if req.Policy == "single" && dstore != nil {
+			if err := tokens.ValidateRefreshForDevice(r.Context(), dstore, rc); err != nil {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+		}
+
+		// Issue new tokens, preserving identity/device info
+		acJWE, rfJWE, acClaims, rfClaims, err := tokens.IssueAccessAndRefreshJWEWithClaims(
+			signKid, signPriv,
+			encKid, &encPriv.PublicKey,
+			algs,
+			rc.Claims.Issuer, rc.Claims.Audience[0], rc.UID, rc.UID, rc.DeviceID, rc.ClientID,
+			time.Duration(req.AccessTTLMinutes)*time.Minute,
+			time.Duration(req.RefreshTTLDays)*24*time.Hour,
+			rc.Scope,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		// Persist rotation and update caches (if Redis available)
+		if store != nil {
+			oldTTL := 24 * time.Hour
+			if rc.Claims.Expiry != nil {
+				oldTTL = time.Until(rc.Claims.Expiry.Time())
+				if oldTTL < 0 {
+					oldTTL = 0
+				}
+			}
+			aTTL := time.Duration(0)
+			rTTL := time.Duration(0)
+			if acClaims.Claims.Expiry != nil {
+				aTTL = time.Until(acClaims.Claims.Expiry.Time())
+			}
+			if rfClaims.Claims.Expiry != nil {
+				rTTL = time.Until(rfClaims.Claims.Expiry.Time())
+			}
+			_ = store.RotateRefreshAndSaveAccessAtomic(r.Context(),
+				rc.RID, oldTTL,
+				acClaims.Claims.ID, acClaims, aTTL,
+				rfClaims.RID, rfClaims.FID, rfClaims, rTTL,
+			)
+			if aTTL > 0 {
+				_ = store.CacheAccessClaims(r.Context(), acJWE, acClaims, aTTL)
+			}
+			if rTTL > 0 {
+				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, rTTL)
+			}
+			// Update device mapping to new RID (keep device single-active on new refresh)
+			if dstore != nil && rc.DeviceID != "" && rc.UID != "" && rTTL > 0 {
+				_ = dstore.SetDeviceRID(r.Context(), rc.UID, rc.DeviceID, rfClaims.RID, rTTL)
+			}
+		}
+
+		_ = json.NewEncoder(w).Encode(refreshPolicyResp{AccessJWE: acJWE, RefreshJWE: rfJWE})
 	})
 
 	// Logout route: revoke by refresh or access token/id
