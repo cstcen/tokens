@@ -132,15 +132,15 @@ func main() {
 		// Persist and warm caches if Redis is enabled
 		if store != nil {
 			ctx := r.Context()
-			if acClaims.Claims.Expiry != nil {
-				ttl := time.Until(acClaims.Claims.Expiry.Time())
-				_ = store.SaveAccess(ctx, acClaims.Claims.ID, acClaims, ttl)
-				_ = store.CacheAccessClaims(ctx, access, acClaims, ttl)
-			}
-			if rcClaims.Claims.Expiry != nil {
-				ttl := time.Until(rcClaims.Claims.Expiry.Time())
-				_ = store.SaveRefresh(ctx, rcClaims.RID, rcClaims.FID, rcClaims, ttl)
-				_ = store.CacheRefreshClaims(ctx, refresh, rcClaims, ttl)
+			if acClaims.Claims.Expiry != nil && rcClaims.Claims.Expiry != nil {
+				aTTL := time.Until(acClaims.Claims.Expiry.Time())
+				rTTL := time.Until(rcClaims.Claims.Expiry.Time())
+				_ = store.SaveAccessRefreshAtomic(ctx,
+					acClaims.Claims.ID, acClaims, aTTL,
+					rcClaims.RID, rcClaims.FID, rcClaims, rTTL,
+				)
+				_ = store.CacheAccessClaims(ctx, access, acClaims, aTTL)
+				_ = store.CacheRefreshClaims(ctx, refresh, rcClaims, rTTL)
 			}
 		}
 		_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
@@ -269,21 +269,32 @@ func main() {
 			return
 		}
 		if store != nil {
-			// Revoke old refresh (tombstone for remaining TTL)
+			// Atomic rotation: save new A/R, update fid->rid, delete old rid, write tombstone
+			oldTTL := 24 * time.Hour
 			if rc.Claims.Expiry != nil {
-				_ = store.RevokeRefresh(r.Context(), rc.RID, time.Until(rc.Claims.Expiry.Time()))
-			} else {
-				_ = store.RevokeRefresh(r.Context(), rc.RID, 24*time.Hour)
+				oldTTL = time.Until(rc.Claims.Expiry.Time())
+				if oldTTL < 0 {
+					oldTTL = 0
+				}
 			}
+			aTTL := 0 * time.Second
+			rTTL := 0 * time.Second
 			if acClaims.Claims.Expiry != nil {
-				ttl := time.Until(acClaims.Claims.Expiry.Time())
-				_ = store.SaveAccess(r.Context(), acClaims.Claims.ID, acClaims, ttl)
-				_ = store.CacheAccessClaims(r.Context(), acJWE, acClaims, ttl)
+				aTTL = time.Until(acClaims.Claims.Expiry.Time())
 			}
 			if rfClaims.Claims.Expiry != nil {
-				ttl := time.Until(rfClaims.Claims.Expiry.Time())
-				_ = store.SaveRefresh(r.Context(), rfClaims.RID, rfClaims.FID, rfClaims, ttl)
-				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, ttl)
+				rTTL = time.Until(rfClaims.Claims.Expiry.Time())
+			}
+			_ = store.RotateRefreshAndSaveAccessAtomic(r.Context(),
+				rc.RID, oldTTL,
+				acClaims.Claims.ID, acClaims, aTTL,
+				rfClaims.RID, rfClaims.FID, rfClaims, rTTL,
+			)
+			if aTTL > 0 {
+				_ = store.CacheAccessClaims(r.Context(), acJWE, acClaims, aTTL)
+			}
+			if rTTL > 0 {
+				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, rTTL)
 			}
 		}
 		_ = json.NewEncoder(w).Encode(refreshResp{AccessJWE: acJWE, RefreshJWE: rfJWE})
