@@ -55,12 +55,12 @@ type TokenStore interface {
 //	p+"ac-cache:"+H  -> JSON(AccessCustomClaims)   EX=ttl (parsed token cache)
 //	p+"rc-cache:"+H  -> JSON(RefreshCustomClaims)  EX=ttl
 type RedisTokenStore struct {
-	rdb    *redis.Client
+	rdb    redis.UniversalClient
 	prefix string
 }
 
 // NewRedisTokenStore creates a store using an existing redis client and optional key prefix.
-func NewRedisTokenStore(rdb *redis.Client, prefix string) *RedisTokenStore {
+func NewRedisTokenStore(rdb redis.UniversalClient, prefix string) *RedisTokenStore {
 	return &RedisTokenStore{rdb: rdb, prefix: prefix}
 }
 
