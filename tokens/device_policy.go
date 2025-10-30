@@ -70,6 +70,12 @@ type IssueResult struct {
 	SameDeviceOutcome SameDeviceOutcome
 	OldRID            string
 	NewRID            string
+	// Issuance artifacts
+	AccessJWE     string
+	RefreshJWE    string
+	AccessClaims  AccessCustomClaims
+	RefreshClaims RefreshCustomClaims
+	Err           error
 }
 
 // HandleSameDevice encapsulates the business handling when a same-device session already exists.
@@ -118,7 +124,7 @@ func IssueAndStoreWithPolicy(
 	accessTTL, refreshTTL time.Duration,
 	scope []string,
 	policy DevicePolicy,
-) (accessJWE, refreshJWE string, accessClaims AccessCustomClaims, refreshClaims RefreshCustomClaims, err error) {
+) (res IssueResult) {
 	return IssueAndStoreWithPolicyWithHandler(
 		ctx, store, dstore,
 		signKid, signPriv,
@@ -149,26 +155,26 @@ func IssueAndStoreWithPolicyWithHandler(
 	scope []string,
 	policy DevicePolicy,
 	handler SameDeviceHandler,
-) (accessJWE, refreshJWE string, accessClaims AccessCustomClaims, refreshClaims RefreshCustomClaims, err error) {
+) (res IssueResult) {
 	// Pre-check same-device before issuing
 	var oldRID string
 	if dstore != nil && deviceID != "" && uid != "" {
 		if rid, exists, derr := dstore.GetDeviceRID(ctx, uid, deviceID); derr != nil {
-			err = derr
+			res.Err = derr
 			return
 		} else if exists && rid != "" {
 			oldRID = rid
 			// If custom handler provided, invoke it first (newRefresh is not yet issued)
 			if handler != nil {
 				if herr := handler(ctx, store, dstore, uid, deviceID, oldRID, RefreshCustomClaims{}, policy); herr != nil {
-					err = herr
+					res.Err = herr
 					return
 				}
 			} else {
 				// Default behavior: reject early or best-effort revoke
 				switch policy {
 				case DevicePolicyRejectIfSameDeviceExists:
-					err = errors.New("same device already logged in")
+					res.Err = errors.New("same device already logged in")
 					return
 				case DevicePolicySingleActivePerDevice:
 					if store != nil {
@@ -183,22 +189,30 @@ func IssueAndStoreWithPolicyWithHandler(
 	}
 
 	// Issue after pre-check
-	accessJWE, refreshJWE, accessClaims, refreshClaims, err = IssueAccessAndRefreshJWEWithClaims(
+	var accessJWE, refreshJWE string
+	var accessClaims AccessCustomClaims
+	var refreshClaims RefreshCustomClaims
+	accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaims(
 		signKid, signPriv, encKid, encPubKey, algs,
 		iss, aud, sub, uid, deviceID, clientID,
 		accessTTL, refreshTTL, scope,
 	)
-	if err != nil {
+	if res.Err != nil {
 		return
 	}
+	res.AccessJWE = accessJWE
+	res.RefreshJWE = refreshJWE
+	res.AccessClaims = accessClaims
+	res.RefreshClaims = refreshClaims
+	res.NewRID = refreshClaims.RID
 
 	// Persist atoms: access+refresh+fid
 	aTTL := ttlFromExpiry(accessClaims.Claims.Expiry.Time(), 0)
 	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
-	if err = store.SaveAccessRefreshAtomic(ctx,
+	if res.Err = store.SaveAccessRefreshAtomic(ctx,
 		accessClaims.Claims.ID, accessClaims, aTTL,
 		refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL,
-	); err != nil {
+	); res.Err != nil {
 		return
 	}
 
@@ -237,8 +251,6 @@ type IssueOptions struct {
 	Handler SameDeviceHandler
 	// Preferred handler using context struct
 	HandlerFunc SameDeviceHandlerFunc
-	// Optional sink to receive same-device outcome information
-	ResultSink *IssueResult
 }
 
 // IssueAndStoreParams wraps all parameters to reduce function argument count.
@@ -251,37 +263,28 @@ type IssueAndStoreParams struct {
 }
 
 // IssueAndStore issues and persists tokens according to provided params, enforcing device policy.
-func IssueAndStore(p IssueAndStoreParams) (
-	accessJWE, refreshJWE string,
-	accessClaims AccessCustomClaims,
-	refreshClaims RefreshCustomClaims,
-	err error,
-) {
+func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	ctx := p.Ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	// Initialize result sink
-	if p.Opts.ResultSink != nil {
-		p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeUnknown
-		p.Opts.ResultSink.SameDeviceChecked = false
-		p.Opts.ResultSink.SameDeviceExisted = false
-		p.Opts.ResultSink.OldRID = ""
-		p.Opts.ResultSink.NewRID = ""
-	}
+	res.SameDeviceOutcome = SameDeviceOutcomeUnknown
+	res.SameDeviceChecked = false
+	res.SameDeviceExisted = false
+	res.OldRID = ""
+	res.NewRID = ""
 
 	// Pre-check same-device before issuing
 	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {
 		if oldRID, exists, derr := p.DStore.GetDeviceRID(ctx, p.In.UID, p.In.DeviceID); derr != nil {
-			err = derr
+			res.Err = derr
 			return
 		} else if exists && oldRID != "" {
-			if p.Opts.ResultSink != nil {
-				p.Opts.ResultSink.SameDeviceChecked = true
-				p.Opts.ResultSink.SameDeviceExisted = true
-				p.Opts.ResultSink.OldRID = oldRID
-			}
+			res.SameDeviceChecked = true
+			res.SameDeviceExisted = true
+			res.OldRID = oldRID
 			// Prefer new-style handler
 			if p.Opts.HandlerFunc != nil {
 				c := SameDeviceContext{
@@ -294,22 +297,20 @@ func IssueAndStore(p IssueAndStoreParams) (
 					DStore:     p.DStore,
 				}
 				if herr := p.Opts.HandlerFunc(ctx, c); herr != nil {
-					err = herr
+					res.Err = herr
 					return
 				}
 			} else if p.Opts.Handler != nil {
 				if herr := p.Opts.Handler(ctx, p.Store, p.DStore, p.In.UID, p.In.DeviceID, oldRID, RefreshCustomClaims{}, p.Opts.Policy); herr != nil {
-					err = herr
+					res.Err = herr
 					return
 				}
 			} else {
 				// Default behavior: reject early or best-effort revoke
 				switch p.Opts.Policy {
 				case DevicePolicyRejectIfSameDeviceExists:
-					if p.Opts.ResultSink != nil {
-						p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeRejected
-					}
-					err = errors.New("same device already logged in")
+					res.SameDeviceOutcome = SameDeviceOutcomeRejected
+					res.Err = errors.New("same device already logged in")
 					return
 				case DevicePolicySingleActivePerDevice:
 					if p.Store != nil {
@@ -318,31 +319,26 @@ func IssueAndStore(p IssueAndStoreParams) (
 							_ = p.Store.RevokeRefresh(ctx, oldRID, oldTTL)
 						}
 					}
-					if p.Opts.ResultSink != nil {
-						p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeSingleActive
-					}
+					res.SameDeviceOutcome = SameDeviceOutcomeSingleActive
 				default:
-					if p.Opts.ResultSink != nil {
-						p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeAllowedExisting
-					}
+					res.SameDeviceOutcome = SameDeviceOutcomeAllowedExisting
 				}
 			}
 		} else {
-			if p.Opts.ResultSink != nil {
-				p.Opts.ResultSink.SameDeviceChecked = true
-				p.Opts.ResultSink.SameDeviceExisted = false
-				p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeNoExisting
-			}
+			res.SameDeviceChecked = true
+			res.SameDeviceExisted = false
+			res.SameDeviceOutcome = SameDeviceOutcomeNoExisting
 		}
 	} else {
-		if p.Opts.ResultSink != nil {
-			p.Opts.ResultSink.SameDeviceChecked = false
-			p.Opts.ResultSink.SameDeviceOutcome = SameDeviceOutcomeNoCheck
-		}
+		res.SameDeviceChecked = false
+		res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
 	}
 
 	// Issue after pre-check
-	accessJWE, refreshJWE, accessClaims, refreshClaims, err = IssueAccessAndRefreshJWEWithClaims(
+	var accessJWE, refreshJWE string
+	var accessClaims AccessCustomClaims
+	var refreshClaims RefreshCustomClaims
+	accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaims(
 		p.In.SignKid, p.In.SignPriv,
 		p.In.EncKid, p.In.EncPubKey,
 		p.In.Algs,
@@ -350,20 +346,22 @@ func IssueAndStore(p IssueAndStoreParams) (
 		p.In.AccessTTL, p.In.RefreshTTL,
 		p.In.Scope,
 	)
-	if err != nil {
+	if res.Err != nil {
 		return
 	}
-	if p.Opts.ResultSink != nil {
-		p.Opts.ResultSink.NewRID = refreshClaims.RID
-	}
+	res.AccessJWE = accessJWE
+	res.RefreshJWE = refreshJWE
+	res.AccessClaims = accessClaims
+	res.RefreshClaims = refreshClaims
+	res.NewRID = refreshClaims.RID
 
 	// Persist
 	aTTL := ttlFromExpiry(accessClaims.Claims.Expiry.Time(), 0)
 	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
-	if err = p.Store.SaveAccessRefreshAtomic(ctx,
+	if res.Err = p.Store.SaveAccessRefreshAtomic(ctx,
 		accessClaims.Claims.ID, accessClaims, aTTL,
 		refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL,
-	); err != nil {
+	); res.Err != nil {
 		return
 	}
 	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {

@@ -147,20 +147,20 @@ func main() {
 			if rs, ok := store.(tokens.DeviceIndexStore); ok {
 				opts = append(opts, tokens.WithDeviceIndex(rs))
 			}
-			access, refresh, acClaims, rcClaims, err := tokens.Issue(r.Context(), store, opts...)
-			if err != nil {
+			res := tokens.Issue(r.Context(), store, opts...)
+			if res.Err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": res.Err.Error()})
 				return
 			}
 			// Optional: warm caches
-			if acClaims.Claims.Expiry != nil {
-				_ = store.CacheAccessClaims(r.Context(), access, acClaims, time.Until(acClaims.Claims.Expiry.Time()))
+			if res.AccessClaims.Claims.Expiry != nil {
+				_ = store.CacheAccessClaims(r.Context(), res.AccessJWE, res.AccessClaims, time.Until(res.AccessClaims.Claims.Expiry.Time()))
 			}
-			if rcClaims.Claims.Expiry != nil {
-				_ = store.CacheRefreshClaims(r.Context(), refresh, rcClaims, time.Until(rcClaims.Claims.Expiry.Time()))
+			if res.RefreshClaims.Claims.Expiry != nil {
+				_ = store.CacheRefreshClaims(r.Context(), res.RefreshJWE, res.RefreshClaims, time.Until(res.RefreshClaims.Claims.Expiry.Time()))
 			}
-			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
+			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: res.AccessJWE, RefreshJWE: res.RefreshJWE})
 			return
 		}
 
@@ -227,13 +227,13 @@ func main() {
 			if rs, ok := store.(tokens.DeviceIndexStore); ok {
 				opts = append(opts, tokens.WithDeviceIndex(rs))
 			}
-			access, refresh, _, _, err := tokens.Issue(r.Context(), store, opts...)
-			if err != nil {
+			res := tokens.Issue(r.Context(), store, opts...)
+			if res.Err != nil {
 				w.WriteHeader(http.StatusBadRequest)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": res.Err.Error()})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: access, RefreshJWE: refresh})
+			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: res.AccessJWE, RefreshJWE: res.RefreshJWE})
 			return
 		}
 		if pol != tokens.DevicePolicyAllowSameDevice {

@@ -87,13 +87,6 @@ func WithSameDeviceHandlerFunc(h SameDeviceHandlerFunc) IssueOption {
 	}
 }
 
-// WithResultSink allows callers to retrieve detailed same-device handling outcomes.
-func WithResultSink(res *IssueResult) IssueOption {
-	return func(p *IssueAndStoreParams) {
-		p.Opts.ResultSink = res
-	}
-}
-
 // WithDeviceIndex provides a DeviceIndexStore for same-device policy enforcement.
 func WithDeviceIndex(dstore DeviceIndexStore) IssueOption {
 	return func(p *IssueAndStoreParams) {
@@ -104,12 +97,7 @@ func WithDeviceIndex(dstore DeviceIndexStore) IssueOption {
 // Issue is the functional-options entrypoint to issue and persist tokens.
 // Required: store, keys (WithKeys), iss/aud (WithAudience), uid (WithSubject), TTLs (WithTTL).
 // Optional: sub (defaults to uid), device/client/scope/policy/handlers/device index.
-func Issue(ctx context.Context, store TokenStore, opts ...IssueOption) (
-	accessJWE, refreshJWE string,
-	accessClaims AccessCustomClaims,
-	refreshClaims RefreshCustomClaims,
-	err error,
-) {
+func Issue(ctx context.Context, store TokenStore, opts ...IssueOption) (res IssueResult) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -126,30 +114,30 @@ func Issue(ctx context.Context, store TokenStore, opts ...IssueOption) (
 	}
 	// Validation
 	if params.Store == nil {
-		err = errors.New("store is required")
+		res.Err = errors.New("store is required")
 		return
 	}
 	if params.In.SignPriv == nil || params.In.SignKid == "" || params.In.EncKid == "" || params.In.EncPubKey == nil {
-		err = errors.New("sign/encrypt keys are required: WithKeys")
+		res.Err = errors.New("sign/encrypt keys are required: WithKeys")
 		return
 	}
 	if params.In.Algs.SignAlg == "" || params.In.Algs.ContentEncryption == "" || params.In.Algs.KeyMgmtAlg == "" {
-		err = errors.New("algs are required in WithKeys")
+		res.Err = errors.New("algs are required in WithKeys")
 		return
 	}
 	if params.In.Iss == "" || params.In.Aud == "" {
-		err = errors.New("issuer and audience are required: WithAudience")
+		res.Err = errors.New("issuer and audience are required: WithAudience")
 		return
 	}
 	if params.In.UID == "" {
-		err = errors.New("uid is required: WithSubject")
+		res.Err = errors.New("uid is required: WithSubject")
 		return
 	}
 	if params.In.Sub == "" {
 		params.In.Sub = params.In.UID
 	}
 	if params.In.AccessTTL <= 0 || params.In.RefreshTTL <= 0 {
-		err = errors.New("positive TTLs are required: WithTTL")
+		res.Err = errors.New("positive TTLs are required: WithTTL")
 		return
 	}
 	return IssueAndStore(params)
