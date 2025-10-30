@@ -3,7 +3,6 @@ package tokens
 import (
 	"context"
 	"crypto/ecdsa"
-	"errors"
 	"time"
 )
 
@@ -11,30 +10,16 @@ import (
 
 // Custom handlers have been removed in favor of explicit policies + ForceReplace flag.
 
-// SameDeviceOutcome indicates which path was taken when handling an existing same-device session.
-type SameDeviceOutcome int
-
-const (
-	SameDeviceOutcomeUnknown SameDeviceOutcome = iota
-	// No same-device check performed (missing dstore/uid/device)
-	SameDeviceOutcomeNoCheck
-	// Checked but no existing session for this device
-	SameDeviceOutcomeNoExisting
-	// Policy allow with existing session present
-	SameDeviceOutcomeAllowedExisting
-	// Policy reject with existing session present
-	SameDeviceOutcomeRejected
-	// Policy single-active with existing session (attempted to revoke previous)
-	SameDeviceOutcomeSingleActive
-)
+// Outcome telemetry removed; callers can infer from Err and helper booleans.
 
 // IssueResult captures side-effects and outcomes during issuing.
 type IssueResult struct {
-	SameDeviceChecked bool
-	SameDeviceExisted bool
-	SameDeviceOutcome SameDeviceOutcome
-	OldRID            string
-	NewRID            string
+	OldRID string
+	NewRID string
+	// Whether this account already had active sessions on other devices during pre-check
+	LoggedInOnOtherDevices bool
+	// Whether there is another account already logged in on this device (if determinable)
+	OtherUsersOnThisDevice bool
 	// Issuance artifacts
 	AccessJWE     string
 	RefreshJWE    string
@@ -97,18 +82,11 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 		ctx = context.Background()
 	}
 
-	// Initialize result sink
-	res.SameDeviceOutcome = SameDeviceOutcomeUnknown
-	res.SameDeviceChecked = false
-	res.SameDeviceExisted = false
-	res.OldRID = ""
-	res.NewRID = ""
+	// Defaults rely on Go zero values
 
 	// Pre-check per-user, same-device existing session: always replace by default
 	if p.DStore != nil && p.In.UID != "" && p.In.DeviceID != "" {
 		if oldRID, exists, _ := p.DStore.GetDeviceRID(ctx, p.In.UID, p.In.DeviceID); exists && oldRID != "" {
-			res.SameDeviceChecked = true
-			res.SameDeviceExisted = true
 			res.OldRID = oldRID
 			if p.Store != nil {
 				if rc, ok, gerr := p.Store.GetRefresh(ctx, oldRID); gerr == nil && ok {
@@ -116,7 +94,6 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 					_ = p.Store.RevokeRefresh(ctx, oldRID, oldTTL)
 				}
 			}
-			res.SameDeviceOutcome = SameDeviceOutcomeSingleActive
 		}
 	}
 
@@ -128,35 +105,30 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	}
 	if p.DStore != nil && p.In.DeviceID != "" {
 		if allowMulti {
-			if !res.SameDeviceChecked {
-				res.SameDeviceChecked = false
-				res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
-			}
+			// no device-occupant enforcement
 		} else {
 			occUID, occRID, exists, derr := p.DStore.GetDeviceOccupant(ctx, p.In.DeviceID)
 			if derr != nil {
 				res.Err = derr
 				return
 			}
-			res.SameDeviceChecked = true
 			if !exists {
-				res.SameDeviceExisted = false
-				res.SameDeviceOutcome = SameDeviceOutcomeNoExisting
+				res.OtherUsersOnThisDevice = false
 			} else {
 				// Occupied by someone
 				if occUID != p.In.UID {
-					res.SameDeviceOutcome = SameDeviceOutcomeRejected
-					res.Err = errors.New("device already occupied by another user")
+					res.OtherUsersOnThisDevice = true
+					res.Err = ErrDeviceOccupied
 					return
 				}
 				// same user occupying: already handled by per-user pre-check above (best-effort revoke)
-				res.SameDeviceExisted = true
 				res.OldRID = occRID
+				res.OtherUsersOnThisDevice = false
 			}
 		}
 	} else {
-		res.SameDeviceChecked = false
-		res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
+		// Unknown in multi-user mode without occupancy index; default false
+		// res.OtherUsersOnThisDevice remains false
 	}
 
 	// Optional: Cross-device replace for same user (顶号其它设备)
@@ -167,6 +139,7 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 					continue
 				}
 				if rid, exists, _ := p.DStore.GetDeviceRID(ctx, p.In.UID, d); exists && rid != "" {
+					res.LoggedInOnOtherDevices = true
 					if p.Store != nil {
 						if rc, ok, gerr := p.Store.GetRefresh(ctx, rid); gerr == nil && ok {
 							oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
@@ -188,8 +161,8 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 					continue
 				}
 				if rid, exists, _ := p.DStore.GetDeviceRID(ctx, p.In.UID, d); exists && rid != "" {
-					res.SameDeviceOutcome = SameDeviceOutcomeRejected
-					res.Err = errors.New("user already logged in on another device")
+					res.LoggedInOnOtherDevices = true
+					res.Err = ErrUserLoggedInElsewhere
 					return
 				}
 				// cleanup stale entries
@@ -264,7 +237,7 @@ func ValidateRefreshForDevice(ctx context.Context, dstore DeviceIndexStore, clai
 		return err
 	}
 	if exists && rid != claims.RID {
-		return errors.New("refresh token is not current for this device")
+		return ErrRefreshNotCurrent
 	}
 	return nil
 }
