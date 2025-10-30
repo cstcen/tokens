@@ -73,17 +73,29 @@ func WithPolicy(policy DevicePolicy) IssueOption {
 	}
 }
 
-// WithSameDeviceHandler sets the legacy-form custom handler.
-func WithSameDeviceHandler(h SameDeviceHandler) IssueOption {
+// WithForceReplace allows replacing the same user's existing session on this device
+// when Policy is DevicePolicySingleActivePerDevice. No effect for other policies.
+func WithForceReplace(force bool) IssueOption {
 	return func(p *IssueAndStoreParams) {
-		p.Opts.Handler = h
+		p.Opts.ForceReplace = force
 	}
 }
 
-// WithSameDeviceHandlerFunc sets the preferred context-based handler.
-func WithSameDeviceHandlerFunc(h SameDeviceHandlerFunc) IssueOption {
+// WithForceLogoutOtherDevices enforces single session per user across devices
+// for DevicePolicySingleActivePerDevice by logging out other devices at login time.
+func WithForceLogoutOtherDevices(force bool) IssueOption {
 	return func(p *IssueAndStoreParams) {
-		p.Opts.HandlerFunc = h
+		p.Opts.ForceLogoutOtherDevices = force
+	}
+}
+
+// WithDeviceAllowMultiUser controls whether a single device can be used by multiple users concurrently.
+// When true (default), multiple users can log in on the same device.
+// When false, the device is exclusive: if occupied, new logins are rejected unless it's the same user and you also set WithForceReplace(true).
+func WithDeviceAllowMultiUser(allow bool) IssueOption {
+	return func(p *IssueAndStoreParams) {
+		p.Opts.DeviceAllowMultiUser = allow
+		p.Opts.DeviceAllowMultiUserSet = true
 	}
 }
 
@@ -96,7 +108,7 @@ func WithDeviceIndex(dstore DeviceIndexStore) IssueOption {
 
 // Issue is the functional-options entrypoint to issue and persist tokens.
 // Required: store, keys (WithKeys), iss/aud (WithAudience), uid (WithSubject), TTLs (WithTTL).
-// Optional: sub (defaults to uid), device/client/scope/policy/handlers/device index.
+// Optional: sub (defaults to uid), device/client/scope/policy/force replace/force logout others/device index.
 func Issue(ctx context.Context, store TokenStore, opts ...IssueOption) (res IssueResult) {
 	if ctx == nil {
 		ctx = context.Background()

@@ -20,31 +20,7 @@ const (
 	DevicePolicySingleActivePerDevice
 )
 
-// SameDeviceHandler allows custom business handling when a same-device session already exists.
-// If provided, it will be called instead of the default DevicePolicy.HandleSameDevice.
-// Returning a non-nil error will abort the issuing flow.
-type SameDeviceHandler func(
-	ctx context.Context,
-	store TokenStore,
-	dstore DeviceIndexStore,
-	uid, deviceID, oldRID string,
-	newRefresh RefreshCustomClaims,
-	policy DevicePolicy,
-) error
-
-// SameDeviceContext bundles information for custom handlers in a single struct.
-type SameDeviceContext struct {
-	UID        string
-	DeviceID   string
-	OldRID     string
-	NewRefresh RefreshCustomClaims
-	Policy     DevicePolicy
-	Store      TokenStore
-	DStore     DeviceIndexStore
-}
-
-// SameDeviceHandlerFunc is a friendlier handler signature using SameDeviceContext.
-type SameDeviceHandlerFunc func(ctx context.Context, c SameDeviceContext) error
+// Custom handlers have been removed in favor of explicit policies + ForceReplace flag.
 
 // SameDeviceOutcome indicates which path was taken when handling an existing same-device session.
 type SameDeviceOutcome int
@@ -78,36 +54,6 @@ type IssueResult struct {
 	Err           error
 }
 
-// HandleSameDevice encapsulates the business handling when a same-device session already exists.
-// For policies:
-// - Allow: no-op
-// - Reject: returns error
-// - SingleActive: best-effort revoke previous refresh (if found in store)
-func (p DevicePolicy) HandleSameDevice(
-	ctx context.Context,
-	store TokenStore,
-	dstore DeviceIndexStore,
-	uid, deviceID, oldRID string,
-	newRefresh RefreshCustomClaims,
-) error {
-	switch p {
-	case DevicePolicyRejectIfSameDeviceExists:
-		return errors.New("same device already logged in")
-	case DevicePolicySingleActivePerDevice:
-		// Best-effort revoke previous refresh if present
-		if store != nil && oldRID != "" {
-			if rc, ok, err := store.GetRefresh(ctx, oldRID); err == nil && ok {
-				oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
-				_ = store.RevokeRefresh(ctx, oldRID, oldTTL)
-			}
-		}
-		return nil
-	default:
-		// Allow: do nothing
-		return nil
-	}
-}
-
 // IssueAndStoreWithPolicy issues access/refresh JWE tokens, persists them in the TokenStore,
 // and optionally enforces a device policy using a DeviceIndexStore.
 // Pass dstore=nil to skip device checks/mapping.
@@ -125,105 +71,35 @@ func IssueAndStoreWithPolicy(
 	scope []string,
 	policy DevicePolicy,
 ) (res IssueResult) {
-	return IssueAndStoreWithPolicyWithHandler(
-		ctx, store, dstore,
-		signKid, signPriv,
-		encKid, encPubKey,
-		algs,
-		iss, aud, sub, uid, deviceID, clientID,
-		accessTTL, refreshTTL,
-		scope,
-		policy,
-		nil,
-	)
+	params := IssueAndStoreParams{
+		Ctx:    ctx,
+		Store:  store,
+		DStore: dstore,
+		In: IssueInputs{
+			SignKid:    signKid,
+			SignPriv:   signPriv,
+			EncKid:     encKid,
+			EncPubKey:  encPubKey,
+			Algs:       algs,
+			Iss:        iss,
+			Aud:        aud,
+			Sub:        sub,
+			UID:        uid,
+			DeviceID:   deviceID,
+			ClientID:   clientID,
+			AccessTTL:  accessTTL,
+			RefreshTTL: refreshTTL,
+			Scope:      scope,
+		},
+		Opts: IssueOptions{Policy: policy},
+	}
+	return IssueAndStore(params)
 }
 
 // IssueAndStoreWithPolicyWithHandler is like IssueAndStoreWithPolicy but supports a custom handler
 // to process the case where an existing same-device session is found. If handler is nil, the default
 // behavior defined by DevicePolicy is used.
-func IssueAndStoreWithPolicyWithHandler(
-	ctx context.Context,
-	store TokenStore,
-	dstore DeviceIndexStore,
-	signKid string,
-	signPriv *ecdsa.PrivateKey,
-	encKid string,
-	encPubKey interface{},
-	algs KeyAlgs,
-	iss, aud, sub, uid, deviceID, clientID string,
-	accessTTL, refreshTTL time.Duration,
-	scope []string,
-	policy DevicePolicy,
-	handler SameDeviceHandler,
-) (res IssueResult) {
-	// Pre-check same-device before issuing
-	var oldRID string
-	if dstore != nil && deviceID != "" && uid != "" {
-		if rid, exists, derr := dstore.GetDeviceRID(ctx, uid, deviceID); derr != nil {
-			res.Err = derr
-			return
-		} else if exists && rid != "" {
-			oldRID = rid
-			// If custom handler provided, invoke it first (newRefresh is not yet issued)
-			if handler != nil {
-				if herr := handler(ctx, store, dstore, uid, deviceID, oldRID, RefreshCustomClaims{}, policy); herr != nil {
-					res.Err = herr
-					return
-				}
-			} else {
-				// Default behavior: reject early or best-effort revoke
-				switch policy {
-				case DevicePolicyRejectIfSameDeviceExists:
-					res.Err = errors.New("same device already logged in")
-					return
-				case DevicePolicySingleActivePerDevice:
-					if store != nil {
-						if rc, ok, gerr := store.GetRefresh(ctx, oldRID); gerr == nil && ok {
-							oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
-							_ = store.RevokeRefresh(ctx, oldRID, oldTTL)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Issue after pre-check
-	var accessJWE, refreshJWE string
-	var accessClaims AccessCustomClaims
-	var refreshClaims RefreshCustomClaims
-	accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaims(
-		signKid, signPriv, encKid, encPubKey, algs,
-		iss, aud, sub, uid, deviceID, clientID,
-		accessTTL, refreshTTL, scope,
-	)
-	if res.Err != nil {
-		return
-	}
-	res.AccessJWE = accessJWE
-	res.RefreshJWE = refreshJWE
-	res.AccessClaims = accessClaims
-	res.RefreshClaims = refreshClaims
-	res.NewRID = refreshClaims.RID
-
-	// Persist atoms: access+refresh+fid
-	aTTL := ttlFromExpiry(accessClaims.Claims.Expiry.Time(), 0)
-	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
-	if res.Err = store.SaveAccessRefreshAtomic(ctx,
-		accessClaims.Claims.ID, accessClaims, aTTL,
-		refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL,
-	); res.Err != nil {
-		return
-	}
-
-	// Update device mapping if available
-	if dstore != nil && deviceID != "" && uid != "" {
-		// For all policies except Reject (which we would have returned earlier)
-		_ = dstore.SetDeviceRID(ctx, uid, deviceID, refreshClaims.RID, rTTL)
-	}
-
-	return
-}
+// IssueAndStoreWithPolicyWithHandler has been removed; use Issue (functional options) or IssueAndStoreWithPolicy.
 
 // IssueInputs groups the inputs required to issue a pair of tokens.
 type IssueInputs struct {
@@ -247,10 +123,19 @@ type IssueInputs struct {
 // IssueOptions configures policy and optional handlers.
 type IssueOptions struct {
 	Policy DevicePolicy
-	// Back-compat classic handler
-	Handler SameDeviceHandler
-	// Preferred handler using context struct
-	HandlerFunc SameDeviceHandlerFunc
+	// When Policy enforces single client per device (DevicePolicySingleActivePerDevice),
+	// ForceReplace=true allows replacing the same user's existing session on this device.
+	// If another user occupies the device, replacement is not allowed and will be rejected.
+	ForceReplace bool
+	// When Policy is DevicePolicySingleActivePerDevice, ForceLogoutOtherDevices=true
+	// will revoke this用户在其他设备上的会话（跨设备单会话）。
+	// 对于其他策略无效。
+	ForceLogoutOtherDevices bool
+	// Independent toggle to control device-level multi-user allowance.
+	// If set to true (default), multiple users can log in on the same device.
+	// If set to false, a device can be occupied by only one user at a time.
+	DeviceAllowMultiUser    bool
+	DeviceAllowMultiUserSet bool
 }
 
 // IssueAndStoreParams wraps all parameters to reduce function argument count.
@@ -276,62 +161,82 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	res.OldRID = ""
 	res.NewRID = ""
 
-	// Pre-check same-device before issuing
-	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {
-		if oldRID, exists, derr := p.DStore.GetDeviceRID(ctx, p.In.UID, p.In.DeviceID); derr != nil {
-			res.Err = derr
-			return
-		} else if exists && oldRID != "" {
-			res.SameDeviceChecked = true
-			res.SameDeviceExisted = true
-			res.OldRID = oldRID
-			// Prefer new-style handler
-			if p.Opts.HandlerFunc != nil {
-				c := SameDeviceContext{
-					UID:        p.In.UID,
-					DeviceID:   p.In.DeviceID,
-					OldRID:     oldRID,
-					NewRefresh: RefreshCustomClaims{},
-					Policy:     p.Opts.Policy,
-					Store:      p.Store,
-					DStore:     p.DStore,
-				}
-				if herr := p.Opts.HandlerFunc(ctx, c); herr != nil {
-					res.Err = herr
-					return
-				}
-			} else if p.Opts.Handler != nil {
-				if herr := p.Opts.Handler(ctx, p.Store, p.DStore, p.In.UID, p.In.DeviceID, oldRID, RefreshCustomClaims{}, p.Opts.Policy); herr != nil {
-					res.Err = herr
-					return
-				}
-			} else {
-				// Default behavior: reject early or best-effort revoke
-				switch p.Opts.Policy {
-				case DevicePolicyRejectIfSameDeviceExists:
-					res.SameDeviceOutcome = SameDeviceOutcomeRejected
-					res.Err = errors.New("same device already logged in")
-					return
-				case DevicePolicySingleActivePerDevice:
-					if p.Store != nil {
-						if rc, ok, gerr := p.Store.GetRefresh(ctx, oldRID); gerr == nil && ok {
-							oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
-							_ = p.Store.RevokeRefresh(ctx, oldRID, oldTTL)
-						}
-					}
-					res.SameDeviceOutcome = SameDeviceOutcomeSingleActive
-				default:
-					res.SameDeviceOutcome = SameDeviceOutcomeAllowedExisting
-				}
-			}
+	// Pre-check device occupancy per configuration
+	// Determine allowMulti based on explicit toggle or legacy policy mapping
+	allowMulti := true
+	if p.Opts.DeviceAllowMultiUserSet {
+		allowMulti = p.Opts.DeviceAllowMultiUser
+	} else {
+		switch p.Opts.Policy {
+		case DevicePolicyRejectIfSameDeviceExists, DevicePolicySingleActivePerDevice:
+			allowMulti = false
+		default:
+			allowMulti = true
+		}
+	}
+	if p.DStore != nil && p.In.DeviceID != "" {
+		if allowMulti {
+			res.SameDeviceChecked = false
+			res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
 		} else {
+			occUID, occRID, exists, derr := p.DStore.GetDeviceOccupant(ctx, p.In.DeviceID)
+			if derr != nil {
+				res.Err = derr
+				return
+			}
 			res.SameDeviceChecked = true
-			res.SameDeviceExisted = false
-			res.SameDeviceOutcome = SameDeviceOutcomeNoExisting
+			if !exists {
+				res.SameDeviceExisted = false
+				res.SameDeviceOutcome = SameDeviceOutcomeNoExisting
+			} else {
+				res.SameDeviceExisted = true
+				res.OldRID = occRID
+				if occUID != p.In.UID {
+					res.SameDeviceOutcome = SameDeviceOutcomeRejected
+					res.Err = errors.New("device already occupied by another user")
+					return
+				}
+				if !p.Opts.ForceReplace {
+					res.SameDeviceOutcome = SameDeviceOutcomeRejected
+					res.Err = errors.New("user already logged in on this device")
+					return
+				}
+				// Force replace: revoke old refresh best-effort
+				if p.Store != nil && occRID != "" {
+					if rc, ok, gerr := p.Store.GetRefresh(ctx, occRID); gerr == nil && ok {
+						oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
+						_ = p.Store.RevokeRefresh(ctx, occRID, oldTTL)
+					}
+				}
+				res.SameDeviceOutcome = SameDeviceOutcomeSingleActive
+			}
 		}
 	} else {
 		res.SameDeviceChecked = false
 		res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
+	}
+
+	// Optional: Enforce user-wide single session by logging out other devices of this user.
+	if p.DStore != nil && p.In.UID != "" && p.Opts.ForceLogoutOtherDevices {
+		if devs, derr := p.DStore.ListUserDevices(ctx, p.In.UID); derr == nil {
+			for _, d := range devs {
+				if d == p.In.DeviceID {
+					continue
+				}
+				if rid, exists, _ := p.DStore.GetDeviceRID(ctx, p.In.UID, d); exists && rid != "" {
+					if p.Store != nil {
+						if rc, ok, gerr := p.Store.GetRefresh(ctx, rid); gerr == nil && ok {
+							oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
+							_ = p.Store.RevokeRefresh(ctx, rid, oldTTL)
+						}
+					}
+				}
+				_ = p.DStore.DelDeviceRID(ctx, p.In.UID, d)
+				if ouid, _, occ, _ := p.DStore.GetDeviceOccupant(ctx, d); occ && ouid == p.In.UID {
+					_ = p.DStore.DelDeviceOccupant(ctx, d)
+				}
+			}
+		}
 	}
 
 	// Issue after pre-check
@@ -364,8 +269,15 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	); res.Err != nil {
 		return
 	}
-	if p.DStore != nil && p.In.DeviceID != "" && p.In.UID != "" {
-		_ = p.DStore.SetDeviceRID(ctx, p.In.UID, p.In.DeviceID, refreshClaims.RID, rTTL)
+	if p.DStore != nil && p.In.DeviceID != "" {
+		// Maintain per-user mapping for refresh validation
+		if p.In.UID != "" {
+			_ = p.DStore.SetDeviceRID(ctx, p.In.UID, p.In.DeviceID, refreshClaims.RID, rTTL)
+		}
+		// Maintain device-wide occupant only when multi-user is not allowed
+		if !allowMulti {
+			_ = p.DStore.SetDeviceOccupant(ctx, p.In.DeviceID, p.In.UID, refreshClaims.RID, rTTL)
+		}
 	}
 	return
 }

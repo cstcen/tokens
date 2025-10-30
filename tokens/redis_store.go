@@ -264,11 +264,25 @@ type DeviceIndexStore interface {
 	GetDeviceRID(ctx context.Context, uid, deviceID string) (string, bool, error)
 	SetDeviceRID(ctx context.Context, uid, deviceID, rid string, ttl time.Duration) error
 	DelDeviceRID(ctx context.Context, uid, deviceID string) error
+	// Device-wide occupancy: only one active session per device (regardless of user)
+	// When set, value stores both uid and rid for the occupant.
+	GetDeviceOccupant(ctx context.Context, deviceID string) (uid string, rid string, exists bool, err error)
+	SetDeviceOccupant(ctx context.Context, deviceID, uid, rid string, ttl time.Duration) error
+	DelDeviceOccupant(ctx context.Context, deviceID string) error
+	// User-wide device index helpers
+	ListUserDevices(ctx context.Context, uid string) ([]string, error)
+	AddUserDevice(ctx context.Context, uid, deviceID string) error
+	RemoveUserDevice(ctx context.Context, uid, deviceID string) error
 }
 
 func (s *RedisTokenStore) deviceKey(uid, deviceID string) string {
 	// Key: prefix + "uxd:" + uid + "|" + deviceID
 	return s.key("uxd:", uid, "|", deviceID)
+}
+
+func (s *RedisTokenStore) userDevicesKey(uid string) string {
+	// Set of deviceIDs for a user
+	return s.key("uxds:", uid)
 }
 
 // GetDeviceRID returns the currently recorded RID for a given user+device.
@@ -285,12 +299,79 @@ func (s *RedisTokenStore) GetDeviceRID(ctx context.Context, uid, deviceID string
 
 // SetDeviceRID sets/updates the device mapping with a TTL (typically refresh TTL).
 func (s *RedisTokenStore) SetDeviceRID(ctx context.Context, uid, deviceID, rid string, ttl time.Duration) error {
-	return s.rdb.Set(ctx, s.deviceKey(uid, deviceID), rid, ttl).Err()
+	if err := s.rdb.Set(ctx, s.deviceKey(uid, deviceID), rid, ttl).Err(); err != nil {
+		return err
+	}
+	// Track device in user's set (best-effort; no TTL to avoid removing set prematurely)
+	_ = s.rdb.SAdd(ctx, s.userDevicesKey(uid), deviceID).Err()
+	return nil
 }
 
 // DelDeviceRID removes the device mapping.
 func (s *RedisTokenStore) DelDeviceRID(ctx context.Context, uid, deviceID string) error {
-	return s.rdb.Del(ctx, s.deviceKey(uid, deviceID)).Err()
+	if err := s.rdb.Del(ctx, s.deviceKey(uid, deviceID)).Err(); err != nil {
+		return err
+	}
+	// Best-effort cleanup from user's set
+	_ = s.rdb.SRem(ctx, s.userDevicesKey(uid), deviceID).Err()
+	return nil
+}
+
+func (s *RedisTokenStore) deviceOccupantKey(deviceID string) string {
+	return s.key("xd:", deviceID)
+}
+
+type deviceOccupant struct {
+	UID string `json:"uid"`
+	RID string `json:"rid"`
+}
+
+// GetDeviceOccupant returns (uid,rid) if a device-wide occupant exists.
+func (s *RedisTokenStore) GetDeviceOccupant(ctx context.Context, deviceID string) (string, string, bool, error) {
+	res, err := s.rdb.Get(ctx, s.deviceOccupantKey(deviceID)).Bytes()
+	if err == redis.Nil {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	var occ deviceOccupant
+	if jerr := json.Unmarshal(res, &occ); jerr != nil {
+		return "", "", false, jerr
+	}
+	return occ.UID, occ.RID, true, nil
+}
+
+// SetDeviceOccupant sets device occupant to (uid,rid) with TTL.
+func (s *RedisTokenStore) SetDeviceOccupant(ctx context.Context, deviceID, uid, rid string, ttl time.Duration) error {
+	b, err := json.Marshal(deviceOccupant{UID: uid, RID: rid})
+	if err != nil {
+		return err
+	}
+	return s.rdb.Set(ctx, s.deviceOccupantKey(deviceID), b, ttl).Err()
+}
+
+// DelDeviceOccupant removes the device-wide occupant mapping.
+func (s *RedisTokenStore) DelDeviceOccupant(ctx context.Context, deviceID string) error {
+	return s.rdb.Del(ctx, s.deviceOccupantKey(deviceID)).Err()
+}
+
+// ListUserDevices returns deviceIDs currently recorded for the user.
+// Note: Entries may be stale if per-device mapping expired; callers can validate and clean up.
+func (s *RedisTokenStore) ListUserDevices(ctx context.Context, uid string) ([]string, error) {
+	res, err := s.rdb.SMembers(ctx, s.userDevicesKey(uid)).Result()
+	if err == redis.Nil {
+		return []string{}, nil
+	}
+	return res, err
+}
+
+func (s *RedisTokenStore) AddUserDevice(ctx context.Context, uid, deviceID string) error {
+	return s.rdb.SAdd(ctx, s.userDevicesKey(uid), deviceID).Err()
+}
+
+func (s *RedisTokenStore) RemoveUserDevice(ctx context.Context, uid, deviceID string) error {
+	return s.rdb.SRem(ctx, s.userDevicesKey(uid), deviceID).Err()
 }
 
 // Helper: TTL remaining from claims' exp (clamped to >=0 and at most maxTTL if >0)

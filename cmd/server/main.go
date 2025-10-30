@@ -37,6 +37,12 @@ type issuePolicyReq struct {
 	issueReq
 	// Policy: "allow" (default) | "reject" | "single"
 	Policy string `json:"policy"`
+	// For policy=="single": if the same user is already logged in on this device,
+	// allow replacing the existing session when Force is true.
+	Force bool `json:"force"`
+	// For policy=="single": if this user is already logged in on other devices,
+	// log them out and keep only this device when ForceUser is true.
+	ForceUser bool `json:"force_user"`
 }
 
 type deviceStatusReq struct {
@@ -226,6 +232,12 @@ func main() {
 			}
 			if rs, ok := store.(tokens.DeviceIndexStore); ok {
 				opts = append(opts, tokens.WithDeviceIndex(rs))
+			}
+			if req.Policy == "single" && req.Force {
+				opts = append(opts, tokens.WithForceReplace(true))
+			}
+			if req.Policy == "single" && req.ForceUser {
+				opts = append(opts, tokens.WithForceLogoutOtherDevices(true))
 			}
 			res := tokens.Issue(r.Context(), store, opts...)
 			if res.Err != nil {
