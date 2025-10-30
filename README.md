@@ -67,6 +67,35 @@ Response:
 { "access_jwe": "...", "refresh_jwe": "..." }
 ```
 
+- `POST /issue_policy` body (requires Redis enabled):
+
+```json
+{
+  "uid": "u123",
+  "sub": "u123",
+  "aud": "api://local",
+  "iss": "https://auth.local",
+  "device_id": "dev1",
+  "client_id": "web",
+  "scope": ["read"],
+  "access_ttl_minutes": 10,
+  "refresh_ttl_days": 14,
+  "allow_multi": true,
+  "force_replace": false
+}
+```
+
+说明：
+
+- `allow_multi`：是否允许同一设备上多个用户同时登录（默认 true）。
+  - true：不做设备占用限制。
+  - false：设备独占；若设备已被其他用户占用则拒绝。
+- `force_replace`：同一“用户”在“其他设备”已登录时，是否顶掉其它设备的会话，仅保留本设备（跨设备单会话）。
+- “同用户在同设备再次登录”默认会顶号，不需要 `force_replace`。
+- 未启用 Redis 时，这些约束无法生效，服务会返回错误提示。
+
+Response 同 `/issue`。
+
 - `POST /verify` body:
 
 ```json
@@ -155,8 +184,7 @@ If you want to avoid JWE/JWS cost entirely on hot paths, issue opaque random tok
 
 - 行为开关（推荐）：
   - `WithDeviceAllowMultiUser(true|false)`：单设备是否允许多用户（默认 true）
-  - `WithForceReplace(true|false)`：同用户在同设备再次登录是否顶号
-  - `WithForceLogoutOtherDevices(true|false)`：该用户是否跨设备单会话（登录时踢掉其它设备）
+  - `WithForceReplace(true|false)`：同用户在不同设备登录时是否顶号（跨设备单会话）；同设备再次登录默认会顶号
 
 发行并持久化（示例）：
 
@@ -170,8 +198,7 @@ res := tokens.Issue(ctx, store,
     tokens.WithScope(scope...),
     tokens.WithTTL(10*time.Minute, 14*24*time.Hour),
     tokens.WithDeviceAllowMultiUser(false),   // 设备不允许多用户
-    tokens.WithForceReplace(true),            // 同用户同设备顶号
-    tokens.WithForceLogoutOtherDevices(true), // 跨设备单会话
+  tokens.WithForceReplace(true),            // 同用户跨设备顶号（仅留本设备）
 )
 if res.Err != nil { /* handle */ }
 ```

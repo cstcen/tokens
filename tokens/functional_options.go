@@ -66,7 +66,7 @@ func WithTTL(accessTTL, refreshTTL time.Duration) IssueOption {
 	}
 }
 
-// WithPolicy removed: use WithDeviceAllowMultiUser/WithForceReplace/WithForceLogoutOtherDevices.
+// WithPolicy removed: use WithDeviceAllowMultiUser/WithForceReplace.
 
 // WithForceReplace allows replacing the same user's existing session on this device
 func WithForceReplace(force bool) IssueOption {
