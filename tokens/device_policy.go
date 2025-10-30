@@ -180,6 +180,25 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 				}
 			}
 		}
+	} else if p.DStore != nil && p.In.UID != "" && !p.Opts.ForceReplace {
+		// Cross-device login NOT allowed: if any other device has active session for this user, reject now
+		if devs, derr := p.DStore.ListUserDevices(ctx, p.In.UID); derr == nil {
+			for _, d := range devs {
+				if d == p.In.DeviceID {
+					continue
+				}
+				if rid, exists, _ := p.DStore.GetDeviceRID(ctx, p.In.UID, d); exists && rid != "" {
+					res.SameDeviceOutcome = SameDeviceOutcomeRejected
+					res.Err = errors.New("user already logged in on another device")
+					return
+				}
+				// cleanup stale entries
+				_ = p.DStore.RemoveUserDevice(ctx, p.In.UID, d)
+				if ouid, _, occ, _ := p.DStore.GetDeviceOccupant(ctx, d); occ && ouid == p.In.UID {
+					_ = p.DStore.DelDeviceOccupant(ctx, d)
+				}
+			}
+		}
 	}
 
 	// Issue after pre-check

@@ -75,8 +75,9 @@ func WithForceReplace(force bool) IssueOption {
 	}
 }
 
-// WithForceReplace enforces single session per user across devices when true:
-// 登录不同设备时，若该用户已在其它设备登录，则是否允许顶号（强制下线其它设备的会话）。
+// WithForceReplace controls cross-device behavior for the same user:
+// - true  : 允许跨设备顶号（若该用户已在其它设备登录，则强制下线其它设备，仅保留本设备）
+// - false : 不允许跨设备登录（若检测到该用户已在其它设备登录，将拒绝本次登录）
 // 注意：同用户在同设备再次登录默认会顶号，不需要此开关。
 
 // WithDeviceAllowMultiUser controls whether a single device can be used by multiple users concurrently.
