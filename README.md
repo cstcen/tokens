@@ -139,40 +139,54 @@ Opaque tokens alternative
 
 If you want to avoid JWE/JWS cost entirely on hot paths, issue opaque random tokens to clients and store all claims in Redis keyed by that opaque ID with TTL. This changes the trust model (now fully server-side state) but can be the most CPU-efficient for very high throughput APIs.
 
-## Same-device login policy (可选)
+## Same-device login controls (可选)
 
-业务有时需要判断“是否在同设备登录”，并决定允许或拒绝。包内新增了设备会话索引与策略工具：
+典型需求：
 
-- 设备索引：`uid + device_id -> 当前刷新令牌 RID`，保存在 Redis，键形如：`<prefix>uxd:<uid>|<device_id>`。
-- 策略枚举：
-  - `DevicePolicyAllowSameDevice` 允许同设备多会话（默认）
-  - `DevicePolicyRejectIfSameDeviceExists` 若同设备已登录则拒绝新登录
-  - `DevicePolicySingleActivePerDevice` 同设备仅保留一个会话，新登录会覆盖旧会话（旧的刷新令牌作废）
+- 单设备是否允许多个用户同时登录
+- 单用户若已在其它设备登录，是否强制下线其它设备账号（跨设备单会话）
 
-发行并持久化时使用：
+本包提供 Redis 索引与开关项（Functional Options）：
+
+- 设备索引：
+  - `uxd:<uid>|<device_id> -> rid`（用户+设备当前会话）
+  - `xd:<device_id> -> {uid,rid}`（设备占用；当不允许多用户时使用）
+  - `uxds:<uid>`（用户的设备集合，用于枚举清理）
+
+- 行为开关（推荐）：
+  - `WithDeviceAllowMultiUser(true|false)`：单设备是否允许多用户（默认 true）
+  - `WithForceReplace(true|false)`：同用户在同设备再次登录是否顶号
+  - `WithForceLogoutOtherDevices(true|false)`：该用户是否跨设备单会话（登录时踢掉其它设备）
+
+发行并持久化（示例）：
 
 ```go
-accessJWE, refreshJWE, ac, rc, err := tokens.IssueAndStoreWithPolicy(
-    ctx, store, store, // TokenStore + DeviceIndexStore (RedisTokenStore 同时实现)
-    "sig-1", signPriv, "enc-1", &encPubKey, algs,
-    iss, aud, sub, uid, deviceID, clientID,
-    10*time.Minute, 14*24*time.Hour,
-    []string{"read"},
-    tokens.DevicePolicySingleActivePerDevice, // 或者 Reject / Allow
+res := tokens.Issue(ctx, store,
+    tokens.WithKeys(signKid, signPriv, encKid, &encPubKey, algs),
+    tokens.WithAudience(iss, aud),
+    tokens.WithSubject(uid, sub),
+    tokens.WithDevice(deviceID),
+    tokens.WithClient(clientID),
+    tokens.WithScope(scope...),
+    tokens.WithTTL(10*time.Minute, 14*24*time.Hour),
+    tokens.WithDeviceAllowMultiUser(false),   // 设备不允许多用户
+    tokens.WithForceReplace(true),            // 同用户同设备顶号
+    tokens.WithForceLogoutOtherDevices(true), // 跨设备单会话
 )
+if res.Err != nil { /* handle */ }
 ```
 
 辅助检查：
 
 ```go
-// 判断是否同设备已登录
+// 判断是否同设备已登录（针对 uxd 索引）
 ok, _ := tokens.IsSameDeviceLoggedIn(ctx, store, uid, deviceID)
 
-// 在刷新接口中校验：当使用 SingleActive 策略时，可防止被新会话“挤下线”的旧 refresh 继续使用
+// 在刷新接口中校验：若使用“设备单客户端”，可防止被新会话“挤下线”的旧 refresh 继续使用
 if err := tokens.ValidateRefreshForDevice(ctx, store, rc); err != nil {
     // 该 refresh 非当前设备的最新会话，拒绝
 }
 ```
 
-注意：这里主要控制刷新令牌（会话）的唯一性。已签发的访问令牌通常短时有效，不一定逐个撤销；
+说明：这里主要控制刷新令牌（会话）的唯一性。访问令牌通常短时有效，不一定逐个撤销；
 可根据需要缩短访问令牌 TTL 或增加访问令牌的服务端校验（例如通过 JTI 索引实现热撤销）。

@@ -66,28 +66,18 @@ func WithTTL(accessTTL, refreshTTL time.Duration) IssueOption {
 	}
 }
 
-// WithPolicy sets the device session policy.
-func WithPolicy(policy DevicePolicy) IssueOption {
-	return func(p *IssueAndStoreParams) {
-		p.Opts.Policy = policy
-	}
-}
+// WithPolicy removed: use WithDeviceAllowMultiUser/WithForceReplace/WithForceLogoutOtherDevices.
 
 // WithForceReplace allows replacing the same user's existing session on this device
-// when Policy is DevicePolicySingleActivePerDevice. No effect for other policies.
 func WithForceReplace(force bool) IssueOption {
 	return func(p *IssueAndStoreParams) {
 		p.Opts.ForceReplace = force
 	}
 }
 
-// WithForceLogoutOtherDevices enforces single session per user across devices
-// for DevicePolicySingleActivePerDevice by logging out other devices at login time.
-func WithForceLogoutOtherDevices(force bool) IssueOption {
-	return func(p *IssueAndStoreParams) {
-		p.Opts.ForceLogoutOtherDevices = force
-	}
-}
+// WithForceReplace enforces single session per user across devices when true:
+// 登录不同设备时，若该用户已在其它设备登录，则是否允许顶号（强制下线其它设备的会话）。
+// 注意：同用户在同设备再次登录默认会顶号，不需要此开关。
 
 // WithDeviceAllowMultiUser controls whether a single device can be used by multiple users concurrently.
 // When true (default), multiple users can log in on the same device.
@@ -108,17 +98,12 @@ func WithDeviceIndex(dstore DeviceIndexStore) IssueOption {
 
 // Issue is the functional-options entrypoint to issue and persist tokens.
 // Required: store, keys (WithKeys), iss/aud (WithAudience), uid (WithSubject), TTLs (WithTTL).
-// Optional: sub (defaults to uid), device/client/scope/policy/force replace/force logout others/device index.
+// Optional: sub (defaults to uid), device/client/scope/allow-multi-user/force replace/device index.
 func Issue(ctx context.Context, store TokenStore, opts ...IssueOption) (res IssueResult) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	params := IssueAndStoreParams{
-		Ctx:   ctx,
-		Store: store,
-		In:    IssueInputs{},
-		Opts:  IssueOptions{Policy: DevicePolicyAllowSameDevice},
-	}
+	params := IssueAndStoreParams{Ctx: ctx, Store: store, In: IssueInputs{}}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&params)

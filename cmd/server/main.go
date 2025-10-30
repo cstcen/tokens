@@ -35,14 +35,11 @@ type issueResp struct {
 // Policy issue request
 type issuePolicyReq struct {
 	issueReq
-	// Policy: "allow" (default) | "reject" | "single"
-	Policy string `json:"policy"`
-	// For policy=="single": if the same user is already logged in on this device,
-	// allow replacing the existing session when Force is true.
-	Force bool `json:"force"`
-	// For policy=="single": if this user is already logged in on other devices,
-	// log them out and keep only this device when ForceUser is true.
-	ForceUser bool `json:"force_user"`
+	// Whether a single device can be used by multiple users concurrently (default true)
+	AllowMulti bool `json:"allow_multi"`
+	// If the same user is already logged in on other devices, when ForceReplace is true,
+	// log them out and keep only this device.
+	ForceReplace bool `json:"force_replace"`
 }
 
 type deviceStatusReq struct {
@@ -209,15 +206,6 @@ func main() {
 			req.RefreshTTLDays = 14
 		}
 
-		// Map string policy to enum
-		pol := tokens.DevicePolicyAllowSameDevice
-		switch req.Policy {
-		case "reject":
-			pol = tokens.DevicePolicyRejectIfSameDeviceExists
-		case "single":
-			pol = tokens.DevicePolicySingleActivePerDevice
-		}
-
 		// If Redis available, use new Issue API with policy; otherwise, allow-only fallback
 		if store != nil {
 			opts := []tokens.IssueOption{
@@ -228,16 +216,15 @@ func main() {
 				tokens.WithDevice(req.DeviceID),
 				tokens.WithScope(req.Scope...),
 				tokens.WithTTL(time.Duration(req.AccessTTLMinutes)*time.Minute, time.Duration(req.RefreshTTLDays)*24*time.Hour),
-				tokens.WithPolicy(pol),
 			}
 			if rs, ok := store.(tokens.DeviceIndexStore); ok {
 				opts = append(opts, tokens.WithDeviceIndex(rs))
 			}
-			if req.Policy == "single" && req.Force {
-				opts = append(opts, tokens.WithForceReplace(true))
+			if !req.AllowMulti {
+				opts = append(opts, tokens.WithDeviceAllowMultiUser(false))
 			}
-			if req.Policy == "single" && req.ForceUser {
-				opts = append(opts, tokens.WithForceLogoutOtherDevices(true))
+			if req.ForceReplace {
+				opts = append(opts, tokens.WithForceReplace(true))
 			}
 			res := tokens.Issue(r.Context(), store, opts...)
 			if res.Err != nil {
@@ -248,12 +235,12 @@ func main() {
 			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: res.AccessJWE, RefreshJWE: res.RefreshJWE})
 			return
 		}
-		if pol != tokens.DevicePolicyAllowSameDevice {
+		if !req.AllowMulti || req.ForceReplace {
 			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "policy requires redis store"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "these options require redis store"})
 			return
 		}
-		// Fallback stateless issue for allow policy
+		// Fallback stateless issue when no constraints to enforce
 		access, refresh, _, _, err := tokens.IssueAccessAndRefreshJWEWithClaims(
 			signKid, signPriv,
 			encKid, &encPriv.PublicKey,

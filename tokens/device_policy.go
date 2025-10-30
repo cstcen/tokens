@@ -7,18 +7,7 @@ import (
 	"time"
 )
 
-// DevicePolicy controls how to handle logins from the same device for the same user.
-type DevicePolicy int
-
-const (
-	// Allow multiple concurrent sessions on the same device (default behavior).
-	DevicePolicyAllowSameDevice DevicePolicy = iota
-	// Reject new login if an active session for the same device already exists.
-	DevicePolicyRejectIfSameDeviceExists
-	// Keep only a single active session per device: new login supersedes the old one.
-	// Old refresh token is revoked and device mapping is updated to the new RID.
-	DevicePolicySingleActivePerDevice
-)
+// DevicePolicy removed: behavior is now controlled by explicit options on IssueOptions.
 
 // Custom handlers have been removed in favor of explicit policies + ForceReplace flag.
 
@@ -54,47 +43,7 @@ type IssueResult struct {
 	Err           error
 }
 
-// IssueAndStoreWithPolicy issues access/refresh JWE tokens, persists them in the TokenStore,
-// and optionally enforces a device policy using a DeviceIndexStore.
-// Pass dstore=nil to skip device checks/mapping.
-func IssueAndStoreWithPolicy(
-	ctx context.Context,
-	store TokenStore,
-	dstore DeviceIndexStore,
-	signKid string,
-	signPriv *ecdsa.PrivateKey,
-	encKid string,
-	encPubKey interface{},
-	algs KeyAlgs,
-	iss, aud, sub, uid, deviceID, clientID string,
-	accessTTL, refreshTTL time.Duration,
-	scope []string,
-	policy DevicePolicy,
-) (res IssueResult) {
-	params := IssueAndStoreParams{
-		Ctx:    ctx,
-		Store:  store,
-		DStore: dstore,
-		In: IssueInputs{
-			SignKid:    signKid,
-			SignPriv:   signPriv,
-			EncKid:     encKid,
-			EncPubKey:  encPubKey,
-			Algs:       algs,
-			Iss:        iss,
-			Aud:        aud,
-			Sub:        sub,
-			UID:        uid,
-			DeviceID:   deviceID,
-			ClientID:   clientID,
-			AccessTTL:  accessTTL,
-			RefreshTTL: refreshTTL,
-			Scope:      scope,
-		},
-		Opts: IssueOptions{Policy: policy},
-	}
-	return IssueAndStore(params)
-}
+// IssueAndStoreWithPolicy removed; use Issue (functional options) or IssueAndStore with IssueOptions.
 
 // IssueAndStoreWithPolicyWithHandler is like IssueAndStoreWithPolicy but supports a custom handler
 // to process the case where an existing same-device session is found. If handler is nil, the default
@@ -122,15 +71,9 @@ type IssueInputs struct {
 
 // IssueOptions configures policy and optional handlers.
 type IssueOptions struct {
-	Policy DevicePolicy
-	// When Policy enforces single client per device (DevicePolicySingleActivePerDevice),
-	// ForceReplace=true allows replacing the same user's existing session on this device.
-	// If another user occupies the device, replacement is not allowed and will be rejected.
+	// ForceReplace=true 表示“同用户在不同设备登录时，是否允许顶号（强制下线其它设备的会话）”。
+	// 注意：同用户在同设备再次登录默认会顶号，不需要此开关。
 	ForceReplace bool
-	// When Policy is DevicePolicySingleActivePerDevice, ForceLogoutOtherDevices=true
-	// will revoke this用户在其他设备上的会话（跨设备单会话）。
-	// 对于其他策略无效。
-	ForceLogoutOtherDevices bool
 	// Independent toggle to control device-level multi-user allowance.
 	// If set to true (default), multiple users can log in on the same device.
 	// If set to false, a device can be occupied by only one user at a time.
@@ -161,23 +104,34 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	res.OldRID = ""
 	res.NewRID = ""
 
-	// Pre-check device occupancy per configuration
-	// Determine allowMulti based on explicit toggle or legacy policy mapping
+	// Pre-check per-user, same-device existing session: always replace by default
+	if p.DStore != nil && p.In.UID != "" && p.In.DeviceID != "" {
+		if oldRID, exists, _ := p.DStore.GetDeviceRID(ctx, p.In.UID, p.In.DeviceID); exists && oldRID != "" {
+			res.SameDeviceChecked = true
+			res.SameDeviceExisted = true
+			res.OldRID = oldRID
+			if p.Store != nil {
+				if rc, ok, gerr := p.Store.GetRefresh(ctx, oldRID); gerr == nil && ok {
+					oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
+					_ = p.Store.RevokeRefresh(ctx, oldRID, oldTTL)
+				}
+			}
+			res.SameDeviceOutcome = SameDeviceOutcomeSingleActive
+		}
+	}
+
+	// Pre-check device occupancy per configuration (different-user block when multi-user disabled)
+	// Determine allowMulti (default true) and allow override via DeviceAllowMultiUser
 	allowMulti := true
 	if p.Opts.DeviceAllowMultiUserSet {
 		allowMulti = p.Opts.DeviceAllowMultiUser
-	} else {
-		switch p.Opts.Policy {
-		case DevicePolicyRejectIfSameDeviceExists, DevicePolicySingleActivePerDevice:
-			allowMulti = false
-		default:
-			allowMulti = true
-		}
 	}
 	if p.DStore != nil && p.In.DeviceID != "" {
 		if allowMulti {
-			res.SameDeviceChecked = false
-			res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
+			if !res.SameDeviceChecked {
+				res.SameDeviceChecked = false
+				res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
+			}
 		} else {
 			occUID, occRID, exists, derr := p.DStore.GetDeviceOccupant(ctx, p.In.DeviceID)
 			if derr != nil {
@@ -189,26 +143,15 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 				res.SameDeviceExisted = false
 				res.SameDeviceOutcome = SameDeviceOutcomeNoExisting
 			} else {
-				res.SameDeviceExisted = true
-				res.OldRID = occRID
+				// Occupied by someone
 				if occUID != p.In.UID {
 					res.SameDeviceOutcome = SameDeviceOutcomeRejected
 					res.Err = errors.New("device already occupied by another user")
 					return
 				}
-				if !p.Opts.ForceReplace {
-					res.SameDeviceOutcome = SameDeviceOutcomeRejected
-					res.Err = errors.New("user already logged in on this device")
-					return
-				}
-				// Force replace: revoke old refresh best-effort
-				if p.Store != nil && occRID != "" {
-					if rc, ok, gerr := p.Store.GetRefresh(ctx, occRID); gerr == nil && ok {
-						oldTTL := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
-						_ = p.Store.RevokeRefresh(ctx, occRID, oldTTL)
-					}
-				}
-				res.SameDeviceOutcome = SameDeviceOutcomeSingleActive
+				// same user occupying: already handled by per-user pre-check above (best-effort revoke)
+				res.SameDeviceExisted = true
+				res.OldRID = occRID
 			}
 		}
 	} else {
@@ -216,8 +159,8 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 		res.SameDeviceOutcome = SameDeviceOutcomeNoCheck
 	}
 
-	// Optional: Enforce user-wide single session by logging out other devices of this user.
-	if p.DStore != nil && p.In.UID != "" && p.Opts.ForceLogoutOtherDevices {
+	// Optional: Cross-device replace for same user (顶号其它设备)
+	if p.DStore != nil && p.In.UID != "" && p.Opts.ForceReplace {
 		if devs, derr := p.DStore.ListUserDevices(ctx, p.In.UID); derr == nil {
 			for _, d := range devs {
 				if d == p.In.DeviceID {
