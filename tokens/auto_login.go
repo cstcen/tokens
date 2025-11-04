@@ -29,9 +29,9 @@ type AutoLoginParams struct {
 	Iss string
 	Aud string
 
-	// New token TTLs
-	AccessTTL  time.Duration
-	RefreshTTL time.Duration
+	// New token TTL providers (computed from the verified refresh claims, e.g., by UID)
+	AccessTTLFunc  func(RefreshCustomClaims) time.Duration
+	RefreshTTLFunc func(RefreshCustomClaims) time.Duration
 
 	// Input refresh token
 	RefreshToken string
@@ -70,7 +70,25 @@ func WithAutoAudience(iss, aud string) AutoLoginOption {
 
 // WithAutoTTL sets the new access/refresh TTLs.
 func WithAutoTTL(accessTTL, refreshTTL time.Duration) AutoLoginOption {
-	return func(p *AutoLoginParams) { p.AccessTTL = accessTTL; p.RefreshTTL = refreshTTL }
+	return func(p *AutoLoginParams) {
+		p.AccessTTLFunc = func(_ RefreshCustomClaims) time.Duration { return accessTTL }
+		p.RefreshTTLFunc = func(_ RefreshCustomClaims) time.Duration { return refreshTTL }
+	}
+}
+
+// WithAutoAccessTTLFunc sets a function to compute access TTL from the incoming refresh claims.
+func WithAutoAccessTTLFunc(f func(RefreshCustomClaims) time.Duration) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.AccessTTLFunc = f }
+}
+
+// WithAutoRefreshTTLFunc sets a function to compute refresh TTL from the incoming refresh claims.
+func WithAutoRefreshTTLFunc(f func(RefreshCustomClaims) time.Duration) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.RefreshTTLFunc = f }
+}
+
+// WithAutoTTLFunc sets both access and refresh TTL providers at once.
+func WithAutoTTLFunc(access func(RefreshCustomClaims) time.Duration, refresh func(RefreshCustomClaims) time.Duration) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.AccessTTLFunc = access; p.RefreshTTLFunc = refresh }
 }
 
 // WithAutoRefreshToken sets the incoming refresh token to be validated and rotated.
@@ -110,8 +128,9 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		err = errors.New("issuer and audience are required: WithAutoAudience")
 		return
 	}
-	if p.AccessTTL <= 0 || p.RefreshTTL <= 0 {
-		err = errors.New("positive TTLs are required: WithAutoTTL")
+	// TTL providers must be provided (use WithAutoTTL or TTLFunc variants)
+	if p.AccessTTLFunc == nil || p.RefreshTTLFunc == nil {
+		err = errors.New("TTL providers are required: WithAutoTTL or WithAutoTTLFunc")
 		return
 	}
 	if p.RefreshToken == "" {
@@ -145,12 +164,20 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 	}
 
 	// Issue fresh tokens, preserving identity/device/client/scope
+	// Compute TTLs based on verified refresh claims (e.g., by UID)
+	accessTTL := p.AccessTTLFunc(rc)
+	refreshTTL := p.RefreshTTLFunc(rc)
+	if accessTTL <= 0 || refreshTTL <= 0 {
+		err = errors.New("computed TTLs must be positive")
+		return
+	}
+
 	accessJWE, refreshJWE, ac, newRC, err := IssueAccessAndRefreshJWEWithClaims(
 		p.SignKid, p.SignPriv,
 		p.EncKid, p.EncPubKey,
 		p.Algs,
 		rc.Claims.Issuer, rc.Claims.Audience[0], rc.UID, rc.UID, rc.DeviceID, rc.ClientID,
-		p.AccessTTL, p.RefreshTTL,
+		accessTTL, refreshTTL,
 		rc.Scope,
 	)
 	if err != nil {
