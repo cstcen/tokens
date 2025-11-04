@@ -351,6 +351,20 @@ func main() {
 		RefreshJWE string `json:"refresh_jwe"`
 	}
 
+	// Auto login via refresh token: verify refresh, rotate, and return new tokens plus basic identity info
+	type autoLoginReq struct {
+		Token string `json:"token"`
+		Iss   string `json:"iss"`
+		Aud   string `json:"aud"`
+	}
+	type autoLoginResp struct {
+		AccessJWE  string `json:"access_jwe"`
+		RefreshJWE string `json:"refresh_jwe"`
+		UID        string `json:"uid"`
+		DeviceID   string `json:"device_id"`
+		ClientID   string `json:"client_id"`
+	}
+
 	// Refresh with device policy (minimal): policy = "allow" (default) | "single"
 	type refreshPolicyReq struct {
 		Token            string `json:"token"`
@@ -448,6 +462,41 @@ func main() {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(refreshResp{AccessJWE: acJWE, RefreshJWE: rfJWE})
+	})
+
+	// Auto login endpoint: client presents a refresh token to obtain fresh tokens (silent sign-in)
+	http.HandleFunc("/auto_login", func(w http.ResponseWriter, r *http.Request) {
+		var req autoLoginReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Iss == "" {
+			req.Iss = "https://auth.local"
+		}
+		if req.Aud == "" {
+			req.Aud = "api://local"
+		}
+
+		acJWE, rfJWE, _, rc, err := tokens.AutoLoginWithRefresh(
+			r.Context(),
+			tokens.WithAutoStore(store),
+			tokens.WithAutoDecryptKey(encPriv),
+			tokens.WithAutoFindSigKey(findSigKeyByKID),
+			tokens.WithAutoKeys(signKid, signPriv, encKid, &encPriv.PublicKey, algs),
+			tokens.WithAutoAudience(req.Iss, req.Aud),
+			tokens.WithAutoTTL(10*time.Minute, 14*24*time.Hour),
+			tokens.WithAutoRefreshToken(req.Token),
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(autoLoginResp{
+			AccessJWE:  acJWE,
+			RefreshJWE: rfJWE,
+			UID:        rc.UID,
+			DeviceID:   rc.DeviceID,
+			ClientID:   rc.ClientID,
+		})
 	})
 
 	http.HandleFunc("/refresh_policy", func(w http.ResponseWriter, r *http.Request) {
