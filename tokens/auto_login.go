@@ -35,6 +35,10 @@ type AutoLoginParams struct {
 
 	// Input refresh token
 	RefreshToken string
+
+	// Optional: custom validator to check whether the uid from refresh claims is allowed to login.
+	// Return ErrUserLoginForbidden (or any error) to block auto login.
+	UIDValidator func(context.Context, string) error
 }
 
 // WithAutoStore sets the TokenStore (optional; when present enables rotation persistence and cache checks).
@@ -94,6 +98,12 @@ func WithAutoTTLFunc(access func(RefreshCustomClaims) time.Duration, refresh fun
 // WithAutoRefreshToken sets the incoming refresh token to be validated and rotated.
 func WithAutoRefreshToken(token string) AutoLoginOption {
 	return func(p *AutoLoginParams) { p.RefreshToken = token }
+}
+
+// WithAutoUIDValidator sets a custom validator to check if a uid is allowed to login.
+// If the validator returns a non-nil error (e.g., ErrUserLoginForbidden), auto login will be aborted.
+func WithAutoUIDValidator(f func(context.Context, string) error) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.UIDValidator = f }
 }
 
 // AutoLoginWithRefresh verifies a refresh token, rotates state (when store provided), and issues new tokens.
@@ -159,6 +169,14 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		}
 		if cur, ok, _ := p.Store.GetFID(ctx, rc.FID); ok && cur != rc.RID {
 			err = ErrRefreshNotCurrent
+			return
+		}
+	}
+
+	// Optional: custom UID validation (e.g., banned/disabled users)
+	if p.UIDValidator != nil {
+		if vErr := p.UIDValidator(ctx, rc.UID); vErr != nil {
+			err = vErr
 			return
 		}
 	}

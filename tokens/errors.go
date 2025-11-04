@@ -16,4 +16,7 @@ var (
 	// ErrRefreshNotCurrent indicates a provided refresh token is not the current one mapped
 	// for the (uid, deviceID), usually due to being replaced by a newer login.
 	ErrRefreshNotCurrent = errors.New("refresh token is not current for this device")
+
+	// ErrUserLoginForbidden indicates the user is forbidden to log in (e.g., banned/disabled).
+	ErrUserLoginForbidden = errors.New("user login forbidden")
 )
