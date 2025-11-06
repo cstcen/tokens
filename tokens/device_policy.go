@@ -3,6 +3,7 @@ package tokens
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"time"
 )
 
@@ -73,6 +74,9 @@ type IssueAndStoreParams struct {
 	DStore DeviceIndexStore
 	In     IssueInputs
 	Opts   IssueOptions
+	// Optional: mutate claims before saving to store/cache.
+	// Do NOT change access.Claims.ID (JTI), refresh.RID or refresh.FID.
+	ClaimsMutator func(context.Context, *AccessCustomClaims, *RefreshCustomClaims) error
 }
 
 // IssueAndStore issues and persists tokens according to provided params, enforcing device policy.
@@ -195,13 +199,32 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	res.RefreshClaims = refreshClaims
 	res.NewRID = refreshClaims.RID
 
-	// Persist
-	aTTL := ttlFromExpiry(accessClaims.Claims.Expiry.Time(), 0)
+	// Optional: mutate claims before persistence/caching, without affecting token contents.
+	if p.ClaimsMutator != nil {
+		origAJTI := accessClaims.Claims.ID
+		origRID := refreshClaims.RID
+		origFID := refreshClaims.FID
+		// Defensive copies to avoid slice aliasing (e.g., Scope)
+		aCopy := accessClaims
+		aCopy.Scope = append([]string(nil), accessClaims.Scope...)
+		rCopy := refreshClaims
+		rCopy.Scope = append([]string(nil), refreshClaims.Scope...)
+		if mErr := p.ClaimsMutator(ctx, &aCopy, &rCopy); mErr != nil {
+			res.Err = mErr
+			return
+		}
+		if aCopy.Claims.ID != origAJTI || rCopy.RID != origRID || rCopy.FID != origFID {
+			res.Err = errors.New("claims mutator cannot change JTI/RID/FID")
+			return
+		}
+		accessClaims = aCopy
+		refreshClaims = rCopy
+	}
+
+	// Persist (compute TTL after potential mutation)
 	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
-	if res.Err = p.Store.SaveAccessRefreshAtomic(ctx,
-		accessClaims.Claims.ID, accessClaims, aTTL,
-		refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL,
-	); res.Err != nil {
+	// Refresh-only persistence: only save refresh + fid mapping
+	if res.Err = p.Store.SaveRefresh(ctx, refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL); res.Err != nil {
 		return
 	}
 	if p.DStore != nil && p.In.DeviceID != "" {

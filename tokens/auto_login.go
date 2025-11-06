@@ -202,7 +202,7 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		return
 	}
 
-	// Persist rotation and caches
+	// Persist rotation and caches (refresh-only model)
 	if p.Store != nil {
 		oldTTL := 24 * time.Hour
 		if rc.Claims.Expiry != nil {
@@ -211,22 +211,14 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 				oldTTL = 0
 			}
 		}
-		aTTL := time.Duration(0)
 		rTTL := time.Duration(0)
-		if ac.Claims.Expiry != nil {
-			aTTL = time.Until(ac.Claims.Expiry.Time())
-		}
 		if newRC.Claims.Expiry != nil {
 			rTTL = time.Until(newRC.Claims.Expiry.Time())
 		}
-		_ = p.Store.RotateRefreshAndSaveAccessAtomic(ctx,
+		_ = p.Store.RotateRefreshAtomic(ctx,
 			rc.RID, oldTTL,
-			ac.Claims.ID, ac, aTTL,
 			newRC.RID, newRC.FID, newRC, rTTL,
 		)
-		if aTTL > 0 {
-			_ = p.Store.CacheAccessClaims(ctx, accessJWE, ac, aTTL)
-		}
 		if rTTL > 0 {
 			_ = p.Store.CacheRefreshClaims(ctx, refreshJWE, newRC, rTTL)
 		}

@@ -156,10 +156,6 @@ func main() {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": res.Err.Error()})
 				return
 			}
-			// Optional: warm caches
-			if res.AccessClaims.Claims.Expiry != nil {
-				_ = store.CacheAccessClaims(r.Context(), res.AccessJWE, res.AccessClaims, time.Until(res.AccessClaims.Claims.Expiry.Time()))
-			}
 			if res.RefreshClaims.Claims.Expiry != nil {
 				_ = store.CacheRefreshClaims(r.Context(), res.RefreshJWE, res.RefreshClaims, time.Until(res.RefreshClaims.Claims.Expiry.Time()))
 			}
@@ -316,24 +312,15 @@ func main() {
 			}
 			_ = json.NewEncoder(w).Encode(verifyResp{Valid: true, Claims: claims})
 		default:
-			if store != nil {
-				if cached, ok, _ := store.GetCachedAccess(r.Context(), req.Token); ok {
-					_ = json.NewEncoder(w).Encode(verifyResp{Valid: true, Claims: cached})
-					return
-				}
-			}
 			claims, err := tokens.DecryptAndVerifyAccess(req.Token, encPriv, findSigKeyByKID, req.Iss, req.Aud)
 			if err != nil {
 				_ = json.NewEncoder(w).Encode(verifyResp{Valid: false, Error: err.Error()})
 				return
 			}
 			if store != nil {
-				if _, found, _ := store.GetAccess(r.Context(), claims.Claims.ID); !found {
-					_ = json.NewEncoder(w).Encode(verifyResp{Valid: false, Error: "revoked or not found"})
+				if revoked, _ := store.IsAccessRevoked(r.Context(), claims.Claims.ID); revoked {
+					_ = json.NewEncoder(w).Encode(verifyResp{Valid: false, Error: "revoked"})
 					return
-				}
-				if claims.Claims.Expiry != nil {
-					_ = store.CacheAccessClaims(r.Context(), req.Token, claims, time.Until(claims.Claims.Expiry.Time()))
 				}
 			}
 			_ = json.NewEncoder(w).Encode(verifyResp{Valid: true, Claims: claims})
@@ -419,7 +406,7 @@ func main() {
 		}
 
 		// Issue new tokens; keep same sub/uid/device/client/scope
-		acJWE, rfJWE, acClaims, rfClaims, err := tokens.IssueAccessAndRefreshJWEWithClaims(
+		acJWE, rfJWE, _, rfClaims, err := tokens.IssueAccessAndRefreshJWEWithClaims(
 			signKid, signPriv,
 			encKid, &encPriv.PublicKey,
 			algs,
@@ -441,22 +428,14 @@ func main() {
 					oldTTL = 0
 				}
 			}
-			aTTL := 0 * time.Second
 			rTTL := 0 * time.Second
-			if acClaims.Claims.Expiry != nil {
-				aTTL = time.Until(acClaims.Claims.Expiry.Time())
-			}
 			if rfClaims.Claims.Expiry != nil {
 				rTTL = time.Until(rfClaims.Claims.Expiry.Time())
 			}
-			_ = store.RotateRefreshAndSaveAccessAtomic(r.Context(),
+			_ = store.RotateRefreshAtomic(r.Context(),
 				rc.RID, oldTTL,
-				acClaims.Claims.ID, acClaims, aTTL,
 				rfClaims.RID, rfClaims.FID, rfClaims, rTTL,
 			)
-			if aTTL > 0 {
-				_ = store.CacheAccessClaims(r.Context(), acJWE, acClaims, aTTL)
-			}
 			if rTTL > 0 {
 				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, rTTL)
 			}
@@ -551,7 +530,7 @@ func main() {
 		}
 
 		// Issue new tokens, preserving identity/device info
-		acJWE, rfJWE, acClaims, rfClaims, err := tokens.IssueAccessAndRefreshJWEWithClaims(
+		acJWE, rfJWE, _, rfClaims, err := tokens.IssueAccessAndRefreshJWEWithClaims(
 			signKid, signPriv,
 			encKid, &encPriv.PublicKey,
 			algs,
@@ -575,22 +554,14 @@ func main() {
 					oldTTL = 0
 				}
 			}
-			aTTL := time.Duration(0)
 			rTTL := time.Duration(0)
-			if acClaims.Claims.Expiry != nil {
-				aTTL = time.Until(acClaims.Claims.Expiry.Time())
-			}
 			if rfClaims.Claims.Expiry != nil {
 				rTTL = time.Until(rfClaims.Claims.Expiry.Time())
 			}
-			_ = store.RotateRefreshAndSaveAccessAtomic(r.Context(),
+			_ = store.RotateRefreshAtomic(r.Context(),
 				rc.RID, oldTTL,
-				acClaims.Claims.ID, acClaims, aTTL,
 				rfClaims.RID, rfClaims.FID, rfClaims, rTTL,
 			)
-			if aTTL > 0 {
-				_ = store.CacheAccessClaims(r.Context(), acJWE, acClaims, aTTL)
-			}
 			if rTTL > 0 {
 				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, rTTL)
 			}
