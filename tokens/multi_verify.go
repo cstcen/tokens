@@ -45,7 +45,7 @@ func TrimBearer(token string) string {
 	return token
 }
 
-// VerifyAccessJWS verifies a compact JWS (JWT) access token without JWE.
+// VerifyAccessJWS verifies a compact signed JWT (JWS) access token without JWE.
 func VerifyAccessJWS(token string, findSigKeyByKID func(string) crypto.PublicKey, issuer, audience string) (AccessCustomClaims, error) {
 	var out AccessCustomClaims
 	token = TrimBearer(token)
@@ -99,7 +99,7 @@ func VerifyRefreshJWS(token string, findSigKeyByKID func(string) crypto.PublicKe
 type LegacyAccessDecoder func(token string) (AccessCustomClaims, error)
 type LegacyRefreshDecoder func(token string) (RefreshCustomClaims, error)
 
-// VerifyAnyAccess tries (in order): structure guess -> JWE -> JWS -> legacy decoder.
+// VerifyAnyAccess tries (in order): structure guess -> JWE -> signed JWT (JWS) -> legacy decoder.
 // Provide encPrivKey for JWE, and findSigKeyByKID for JWS/JWE. Pass nil if a mode isn't needed.
 func VerifyAnyAccess(token string, encPrivKey interface{}, findSigKeyByKID func(string) crypto.PublicKey, issuer, audience string, legacy LegacyAccessDecoder) (AccessCustomClaims, error) {
 	var zero AccessCustomClaims

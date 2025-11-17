@@ -74,6 +74,9 @@ type IssueAndStoreParams struct {
 	// Optional: mutate claims BEFORE signing so custom fields are embedded in tokens.
 	// MUST NOT change identifiers: access.Claims.ID (JTI), refresh.RID, refresh.FID.
 	PreSignClaimsMutator func(context.Context, *AccessCustomClaims, *RefreshCustomClaims) error
+	// Optional: extra top-level fields to embed into signed JWTs.
+	PreSignAccessExtra  map[string]interface{}
+	PreSignRefreshExtra map[string]interface{}
 	// Optional: externalized payload associated with refresh RID.
 	// When provided and the store supports atomic writes, it will be saved in the
 	// same Redis transaction and with the same TTL as the RID/FID records.
@@ -194,6 +197,8 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 			func(ac *AccessCustomClaims, rc *RefreshCustomClaims) error {
 				return p.PreSignClaimsMutator(ctx, ac, rc)
 			},
+			p.PreSignAccessExtra,
+			p.PreSignRefreshExtra,
 		)
 	} else {
 		accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaims(

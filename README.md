@@ -1,51 +1,238 @@
-# JWE Tokens (nested JWS -> JWE)
+# JWE Tokens (Nested signed JWT (JWS) -> JWE)
 
-This module provides helpers to issue Access/Refresh tokens as nested JWS (ES256) wrapped in JWE (RSA-OAEP-256 + A256GCM), plus a tiny demo server.
+[中文版 README](./README.zh.md) ｜ English & Chinese mixed summary below
 
-## Layout
+English | 中文双语 README，面向高并发下的安全访问 / 刷新令牌发行、验证、轮换、撤销与设备会话控制。
 
-- `tokens/` package
-  - `IssueAccessAndRefreshJWE` — sign (ES256) then encrypt (JWE)
-  - `DecryptAndVerifyAccess` / `DecryptAndVerifyRefresh` — decrypt JWE, verify inner JWS, parse claims
-  - `GenerateES256Key` / `GenerateRSA2048` — demo key generators
-- `cmd/server` — demo HTTP server exposing `/issue` and `/verify`
+This library issues Access & Refresh tokens as nested signed JWT (JWS, ES256) wrapped in JWE (ECDH-ES + A256KW + A256GCM by default, optional RSA-OAEP-256). It provides:
 
-## Algorithms
+- Functional Options based issuance API (`Issue`, `AuthLogin`, `AutoLoginWithRefresh`).
+- Device + cross-device session policies (multi-user per device, force replace, single active).
+- Redis-backed state (refresh persistence, rotation, revocation tombstones, parsed-claims cache, device indexes).
+- Stateless fallback (pure cryptographic tokens) when Redis is not enabled.
+- Unified verification helpers supporting JWE, JWS-only, and legacy opaque tokens.
 
-- Inner JWS: ES256 (P-256). Header: `typ=JWT`, `kid=<sig_kid>`
-- Outer JWE: ECDH-ES + A256KW (key mgmt) + A256GCM (content). Header: `cty=JWT`, `kid=<enc_kid>`
+```mermaid
+flowchart TD
+  A[Init] --> A1[Load ES256 sign key + enc key]
+  A --> A2[Configure KeyAlgs + options]
 
-### Notes
+  subgraph Issuance
+    B([issue / Issue]) --> C{Redis enabled?}
+    C -- yes --> D{Device policy\nallow_multi / force_replace}
+    D -- violate --> E[Reject]
+    D -- pass --> F[Update indexes\nuxd / xd / uxds]
+    C -- no --> G[Skip policy]
+    F --> H[Build claims (access, refresh)]
+    G --> H
+    H --> I[Sign JWT (ES256)]
+    I --> J[Encrypt JWE (ECDH-ES+A256KW+A256GCM)]
+    J --> K{Stateful?}
+    K -- yes --> L[Persist refresh + mappings]
+    K -- no --> M[Stateless]
+    L --> N[Return tokens]
+    M --> N
+  end
 
-“ES256”是JWS签名算法名称；JWE没有“ES256”算法，使用的是基于椭圆曲线的 ECDH-ES（可选直连或 A256KW 包裹）。
+  subgraph Verification
+    V([verify / DecryptAndVerify]) --> V0{Cache hit?}
+    V0 -- yes --> V1[Return cached claims]
+    V0 -- no --> V2[Decrypt JWE]
+    V2 --> V3[Verify inner JWT]
+    V3 --> V4[Validate iss aud exp nbf]
+    V4 --> V5{Check Redis state}
+    V5 -- revoked --> V7[Reject]
+    V5 -- ok --> V8[Accept]
+    V8 --> V9[Cache claims]
+    V9 --> V1
+  end
 
-- 如需 RSA，也可改为 `RSA_OAEP_256` + `A256GCM`。
+  subgraph Refresh
+    R([refresh / auto_login]) --> R1[Decrypt+Verify refresh]
+    R1 --> R2{ValidateRefreshForDevice}
+    R2 -- fail --> R3[Reject]
+    R2 -- pass --> R4[Issue new pair]
+    R4 --> R5[Rotate old refresh (tombstone)]
+  end
 
-## Performance considerations
+  subgraph Revocation
+    X([logout / revoke]) --> X1[Write tombstone + delete]
+  end
 
-- Crypto cost: issuing a token performs one ECDSA-P256 signature and one JWE encryption (AES-GCM + RSA/ECDH key agreement). On modern CPUs this is typically sub-millisecond to a few milliseconds per token, but depends on hardware and key choice. Decrypt+verify is similar in reverse. If you expect very high QPS, prefer:
-  - Reuse jose.Signer and jose.Encrypter instances where practical.
-  - Keep claims minimal to reduce payload size.
-  - Use ECDH-ES + A256GCM for JWE on EC keys to avoid RSA costs if your infra supports it.
-  - Offload repeated verifications by caching parsed claims keyed by a token hash (see Redis section).
-  - If you can avoid confidentiality, consider JWS-only access tokens and keep refresh tokens encrypted.
-
-## Run locally (optional)
-
-1) Ensure Go 1.22+ is installed.
-2) From this folder:
-
-```powershell
-# Optional: download deps
-# go mod tidy
-
-# Run demo server
-# go run ./cmd/server
+  N --> V
+  V1 --> R
+  R5 --> V
 ```
 
-Endpoints:
+## Contents
 
-- `POST /issue` body:
+- Overview / 目标
+- Quick Start
+- Core Features
+- Algorithms & Formats
+- Architecture & Flows
+- API Surface (Summary)
+- Device & Session Policies
+- Redis Data Model
+- Verification Modes & Opaque Alternative
+- Performance Notes
+- Production Guidance
+- Demo Server Endpoints
+- Code Examples
+
+## 1. Overview / 目标
+
+
+Provide secure, compact, cache-friendly Access & Refresh tokens with optional server-side state and fine-grained device / cross-device constraints. 可在“纯加密无状态”与“Redis 有状态”间自由切换。
+
+---
+
+## 2. Quick Start
+
+```powershell
+go mod tidy
+go run ./cmd/server
+```
+
+Issue a token pair (stateless or stateful if Redis configured) via POST `/issue`.
+
+---
+
+## 3. Core Features
+
+- Nested signed JWT (JWS) -> JWE (confidentiality + integrity); optional signed JWT (JWS)-only for access.
+- Functional Options for issuance (`Issue`, `AuthLogin`, `AutoLoginWithRefresh`).
+- Refresh rotation & tombstone revocation.
+- Device occupancy + cross-device single-session enforcement.
+- Parsed-claims cache to offload crypto on hot paths.
+- Extensible verification: `VerifyAnyAccess` / `VerifyAnyRefresh` auto-detect JWE/signed JWT (JWS)/legacy.
+- Mutator hook for persisted claims (without altering signed IDs).
+
+---
+
+## 4. Algorithms & Formats
+
+- Inner signed JWT (JWS): ES256 (P-256) header: `typ=JWT`, `kid=<sig_kid>`
+- Outer JWE (default): ECDH-ES + A256KW + A256GCM header: `cty=JWT`, `kid=<enc_kid>`
+- Optional RSA: `RSA_OAEP_256` + `A256GCM` (adjust `KeyAlgs.KeyMgmtAlg`).
+- Refresh claims include `RID` (refresh id) and `FID` (family id) for rotation.
+
+“ES256” 是签名算法；JWE 使用 ECDH-ES (可选直接或 A256KW 包裹) 与内容加密算法。
+
+---
+
+## 5. Architecture & Flows
+
+See Mermaid diagram above: Issuance, Verification, Refresh/Rotation, Revocation, Policy checks.
+
+---
+
+## 6. API Surface (Summary)
+
+Key Types:
+
+- `AccessCustomClaims`, `RefreshCustomClaims`, `KeyAlgs`, `IssueResult`, `AuthSeed`.
+- Errors: `ErrDeviceOccupied`, `ErrUserLoggedInElsewhere`, `ErrRefreshNotCurrent`, `ErrUserLoginForbidden`.
+
+Issuance:
+
+- Low-level: `IssueAccessAndRefreshJWE`, `IssueAccessAndRefreshJWEWithClaims`.
+- High-level: `Issue(...)` with options: `WithKeys`, `WithSubject`, `WithAudience`, `WithClient`, `WithDevice`, `WithScope`, `WithTTL`, `WithForceReplace`, `WithDeviceAllowMultiUser`, `WithDeviceIndex`.
+- Auth login: `AuthLogin` + `WithAuthStore`, `WithAuthIssueOptions`, `WithAuthTTL`, `WithAuthTTLFunc`, `WithAuthUIDValidator`.
+- Auto login (silent refresh): `AutoLoginWithRefresh` + `WithAuto*` options.
+
+Verification:
+
+- `DecryptAndVerifyAccess`, `DecryptAndVerifyRefresh`.
+- `VerifyAccessJWS`, `VerifyRefreshJWS`, `VerifyAnyAccess`, `VerifyAnyRefresh`, `GuessTokenKind`.
+
+Policy Helpers:
+
+- `IsSameDeviceLoggedIn`, `ValidateRefreshForDevice`.
+
+State / Store:
+
+- `RedisTokenStore` implements `TokenStore` + `DeviceIndexStore` (refresh persistence / rotation / occupant & per-user device index / parsed claims cache / revocation tombstones).
+
+Keys:
+
+- `GenerateES256Key`, `GenerateRSA2048`.
+
+---
+
+## 7. Device & Session Policies / 设备与会话策略
+
+Functional Options control behavior:
+
+| Option | 描述 |
+|--------|------|
+| `WithDeviceAllowMultiUser(false)` | 单设备独占模式（默认 true 允许多用户）|
+| `WithForceReplace(true)` | 跨设备单会话：同用户在其它设备已登录时顶号；false 则拒绝新的登录|
+| 默认同设备再次登录 | 自动顶号，无需额外开关 |
+
+辅助检查：`ValidateRefreshForDevice` 确保刷新令牌为当前设备最新；`IsSameDeviceLoggedIn` 查询同设备是否已有会话。
+
+---
+
+## 8. Redis Data Model / 键模式
+
+Prefix configurable (examples use `auth:`). Keys:
+
+- `rtk:{rid}`: JSON(refresh claims) EX=ttl
+- `fid:{fid}`: current RID for family rotation
+- `rev:a:{jti}`: access revocation tombstone
+- `rev:r:{rid}`: refresh revocation tombstone
+- `rc-cache:{sha256(token)}`: cached parsed refresh claims
+- `uxd:{uid}|{device}`: current RID per user+device
+- `xd:{device}`: occupant `{uid,rid}` when multi-user disabled
+- `uxds:{uid}`: set of device IDs (per user)
+
+TTL derives from token expiry; tombstones mitigate replay after deletion.
+
+---
+
+## 9. Verification Modes & Opaque Alternative
+
+`VerifyAnyAccess` / `VerifyAnyRefresh` attempt: structure guess -> JWE -> signed JWT (JWS) -> legacy decoder.
+
+Opaque Alternative: issue random IDs, store full claims server-side (reference tokens). Trades cryptographic self-containment for CPU savings & instantaneous revocation.
+
+---
+
+## 10. Performance Notes
+
+Issuance: 1 ECDSA-P256 signature + 1 JWE encryption (ECDH-ES key agreement + AES-GCM). Verify does inverse operations. Tips:
+
+- Reuse signer/encrypter instances when batching.
+- Keep claims small (minimize ciphertext length & CPU).
+- Cache parsed claims for repeat verification in shared Redis.
+- Consider signed JWT (JWS)-only access (no confidentiality) for lighter hot-path tokens.
+
+---
+
+## 11. Production Guidance / 生产建议
+
+- Separate key sets (`use=sig` vs `use=enc`), rotate `kid` regularly.
+- Pin allowed algorithms; reject unexpected header algs.
+- Enforce TTL bounds; monitor refresh rotation suspicious frequencies.
+- Consider key pinning per client/service; apply rate limiting on refresh endpoints.
+- Use structured auditing for revocation / force-replace events.
+
+---
+
+## 12. Demo Server Endpoints
+
+`POST /issue` – basic issuance (stateless fallback).
+`POST /issue_policy` – issuance with device/cross-device flags (`allow_multi`, `force_replace`).
+`POST /verify` – verify access or refresh (`type=access|refresh`).
+`POST /refresh` – rotate refresh + new access (simple TTLs).
+`POST /auto_login` – silent sign-in using a refresh token.
+`POST /refresh_policy` – refresh with device policy check.
+`POST /logout` – revoke by token/JTI/RID.
+`POST /revoke` – tombstone revoke (access or refresh).
+`POST /device_status` – check same-device login existence.
+
+Example `/issue` request:
 
 ```json
 {
@@ -61,161 +248,103 @@ Endpoints:
 }
 ```
 
-Response:
-
-```json
-{ "access_jwe": "...", "refresh_jwe": "..." }
-```
-
-- `POST /issue_policy` body (requires Redis enabled):
+Policy request extra fields:
 
 ```json
 {
-  "uid": "u123",
-  "sub": "u123",
-  "aud": "api://local",
-  "iss": "https://auth.local",
-  "device_id": "dev1",
-  "client_id": "web",
-  "scope": ["read"],
-  "access_ttl_minutes": 10,
-  "refresh_ttl_days": 14,
   "allow_multi": true,
   "force_replace": false
 }
 ```
 
-说明：
+---
 
-- `allow_multi`：是否允许同一设备上多个用户同时登录（默认 true）。
-  - true：不做设备占用限制。
-  - false：设备独占；若设备已被其他用户占用则拒绝。
-- `force_replace`：同一“用户”在“其他设备”已登录时，是否顶掉其它设备的会话，仅保留本设备（跨设备单会话）。
-  - true：允许跨设备顶号；会踢下其它设备，仅保留本设备。
-  - false：不允许跨设备登录；若检测到该用户在其它设备已登录，则拒绝本次登录。
-- “同用户在同设备再次登录”默认会顶号，不需要 `force_replace`。
-- 未启用 Redis 时，这些约束无法生效，服务会返回错误提示。
+## 13. Code Examples
 
-Response 同 `/issue`。
-
-- `POST /verify` body:
-
-```json
-{ "type": "access", "token": "<JWE>", "iss": "https://auth.local", "aud": "api://local" }
-```
-
-## Move into E:\\Code\\tokens
-
-If your target repo is `E:\Code\tokens`, you can:
-
-- Copy this `authjwe` folder into `E:\Code\tokens` (or merge `tokens/` into your package path of choice)
-- Update `module` path in `go.mod` to match your repository, e.g. `module github.com/cstcen/tokens`
-- Adjust imports if you move the package path
-- Run:
-
-```powershell
-# In E:\Code\tokens
-# go mod tidy
-# go build ./...
-# go test ./...
-```
-
-## Production notes
-
-- For production, manage separate JWKS for `use=sig` and `use=enc`, rotate `kid` regularly, and pin algorithm allowlists.
-- If you prefer ECDH-ES instead of RSA-OAEP-256 for JWE, change `KeyMgmtAlg` accordingly and supply EC keys.
-
-## Redis integration
-
-This repo includes an optional `RedisTokenStore` (`tokens/redis_store.go`) to integrate with Redis for two purposes:
-
-### 1) Stateful/session style tokens (reference tokens)
-
-- Store access by JTI and refresh by RID with TTL matching their expiry:
+Minimal issuance (stateful with Redis device policy):
 
 ```go
-store := tokens.NewRedisTokenStore(redisClient, "auth:")
-// After issuing tokens
-_ = store.SaveAccess(ctx, accessClaims.ID, accessClaims, time.Until(accessClaims.Claims.Expiry.Time()))
-_ = store.SaveRefresh(ctx, refreshClaims.RID, refreshClaims.FID, refreshClaims, time.Until(refreshClaims.Claims.Expiry.Time()))
-
-// On API request: extract JTI from claims (after verify) and check revocation or fetch session
-if _, found, _ := store.GetAccess(ctx, accessClaims.ID); !found { /* treat as revoked/expired */ }
-```
-
-- Revoke by deleting keys and writing a short-lived tombstone to prevent racey reuse:
-
-```go
-_ = store.RevokeAccess(ctx, accessClaims.ID, 10*time.Minute)
-_ = store.RevokeRefresh(ctx, refreshClaims.RID, 24*time.Hour)
-```
-
-### 2) Cache parsed claims to reduce JWE decrypt/verify CPU
-
-- Cache on first successful verify using a hash(token) key with TTL up to expiry:
-
-```go
-// Verify path (access)
-if cached, ok, _ := store.GetCachedAccess(ctx, token); ok {
-  return cached
-}
-claims, err := tokens.DecryptAndVerifyAccess(token, encPrivKey, findSigKeyByKID, iss, aud)
-if err != nil { /* handle */ }
-_ = store.CacheAccessClaims(ctx, token, claims, time.Until(claims.Claims.Expiry.Time()))
-```
-
-This does not eliminate crypto entirely (first hit still decrypts), but it avoids repeated decrypt+verify for the same token across services behind a shared Redis.
-
-Opaque tokens alternative
-
-If you want to avoid JWE/JWS cost entirely on hot paths, issue opaque random tokens to clients and store all claims in Redis keyed by that opaque ID with TTL. This changes the trust model (now fully server-side state) but can be the most CPU-efficient for very high throughput APIs.
-
-## Same-device login controls (可选)
-
-典型需求：
-
-- 单设备是否允许多个用户同时登录
-- 单用户若已在其它设备登录，是否强制下线其它设备账号（跨设备单会话）
-
-本包提供 Redis 索引与开关项（Functional Options）：
-
-- 设备索引：
-  - `uxd:<uid>|<device_id> -> rid`（用户+设备当前会话）
-  - `xd:<device_id> -> {uid,rid}`（设备占用；当不允许多用户时使用）
-  - `uxds:<uid>`（用户的设备集合，用于枚举清理）
-
-- 行为开关（推荐）：
-  - `WithDeviceAllowMultiUser(true|false)`：单设备是否允许多用户（默认 true）
-  - `WithForceReplace(true|false)`：同用户在不同设备登录时是否顶号（跨设备单会话）；同设备再次登录默认会顶号
-
-发行并持久化（示例）：
-
-```go
+algs := tokens.KeyAlgs{SignAlg: jose.ES256, KeyMgmtAlg: jose.ECDH_ES_A256KW, ContentEncryption: jose.A256GCM}
 res := tokens.Issue(ctx, store,
     tokens.WithKeys(signKid, signPriv, encKid, &encPubKey, algs),
     tokens.WithAudience(iss, aud),
     tokens.WithSubject(uid, sub),
     tokens.WithDevice(deviceID),
     tokens.WithClient(clientID),
-    tokens.WithScope(scope...),
+    tokens.WithScope("read"),
     tokens.WithTTL(10*time.Minute, 14*24*time.Hour),
-    tokens.WithDeviceAllowMultiUser(false),   // 设备不允许多用户
-  tokens.WithForceReplace(true),            // 同用户跨设备顶号（仅留本设备）
+    tokens.WithDeviceAllowMultiUser(false), // device exclusive
+    tokens.WithForceReplace(true),          // cross-device single session
 )
-if res.Err != nil { /* handle */ }
+if res.Err != nil { panic(res.Err) }
+fmt.Println(res.AccessJWE, res.RefreshJWE)
 ```
 
-辅助检查：
+Silent auto-login (refresh rotation + new pair):
 
 ```go
-// 判断是否同设备已登录（针对 uxd 索引）
-ok, _ := tokens.IsSameDeviceLoggedIn(ctx, store, uid, deviceID)
+newAccess, newRefresh, ac, rc, err := tokens.AutoLoginWithRefresh(
+    ctx,
+    tokens.WithAutoStore(store),
+    tokens.WithAutoDecryptKey(encPriv),
+    tokens.WithAutoFindSigKey(findSigKeyByKID),
+    tokens.WithAutoKeys(signKid, signPriv, encKid, &encPubKey, algs),
+    tokens.WithAutoAudience(iss, aud),
+    tokens.WithAutoTTL(10*time.Minute, 14*24*time.Hour),
+    tokens.WithAutoRefreshToken(oldRefresh),
+)
+```
 
-// 在刷新接口中校验：若使用“设备单客户端”，可防止被新会话“挤下线”的旧 refresh 继续使用
-if err := tokens.ValidateRefreshForDevice(ctx, store, rc); err != nil {
-    // 该 refresh 非当前设备的最新会话，拒绝
+Unified verification (works for JWE/signed JWT (JWS)/opaque):
+
+```go
+claims, err := tokens.VerifyAnyAccess(token, encPriv, findSigKeyByKID, iss, aud, legacyDecoder)
+```
+
+Validate refresh token for current device mapping:
+
+```go
+if err := tokens.ValidateRefreshForDevice(ctx, dstore, refreshClaims); err != nil {
+    // reject: not current
 }
 ```
 
-说明：这里主要控制刷新令牌（会话）的唯一性。访问令牌通常短时有效，不一定逐个撤销；
-可根据需要缩短访问令牌 TTL 或增加访问令牌的服务端校验（例如通过 JTI 索引实现热撤销）。
+Opaque token strategy (示例思路): random 32-byte ID -> Redis `opaque:<id>` JSON(claims) TTL=exp.
+
+---
+
+## Move Module / 调整模块路径
+
+Update `go.mod` to your module path (e.g. `module github.com/yourorg/tokens`) and fix imports.
+
+```powershell
+go mod tidy
+go build ./...
+go test ./...
+```
+
+---
+
+## FAQ
+
+Q: Why nested JWE?  Confidentiality of claims (device/client/scope) and kid separation; enables selective disclosure scenarios.
+Q: Why keep refresh state but not access?  Access can remain short-lived & stateless for scale; refresh rotation + revocation handles session security.
+Q: How to switch to RSA?  Replace `KeyAlgs.KeyMgmtAlg` with `jose.RSA_OAEP_256` and supply `*rsa.PublicKey` / private for decrypt.
+
+---
+
+## License
+
+Internal / TBD (add your license statement here).
+
+---
+
+## Change Log (Highlights)
+
+- Introduced functional options issuance (`Issue`, `AuthLogin`, `AutoLoginWithRefresh`).
+- Added device indexes (uxd / xd / uxds) and cross-device policies.
+- Added parsed claims cache + VerifyAny* helpers.
+- Added refresh family rotation (RID/FID + atomic rotate).
+
+---
+欢迎反馈改进建议。Enjoy secure & efficient token flows!

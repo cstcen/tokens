@@ -40,7 +40,7 @@ type KeyAlgs struct {
 	ContentEncryption jose.ContentEncryption
 }
 
-// IssueAccessAndRefreshJWE issues Access and Refresh as nested JWS->JWE
+// IssueAccessAndRefreshJWE issues Access and Refresh as nested signed JWT (JWS) -> JWE
 // signPriv: ECDSA private key for inner JWS (ES256)
 // encPubKey: recipient encryption public key for outer JWE (RSA or EC depending on KeyMgmtAlg)
 func IssueAccessAndRefreshJWE(
@@ -75,7 +75,7 @@ func IssueAccessAndRefreshJWEWithClaims(
 ) (accessJWE, refreshJWE string, accessClaims AccessCustomClaims, refreshClaims RefreshCustomClaims, err error) {
 	now := time.Now()
 
-	// ---- Access claims -> JWS -> JWE ----
+	// ---- Access claims -> signed JWT -> JWE ----
 	accessJti := uuid.NewString()
 	accessClaims = AccessCustomClaims{
 		Scope:    scope,
@@ -100,7 +100,7 @@ func IssueAccessAndRefreshJWEWithClaims(
 		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
 
-	// ---- Refresh claims -> JWS -> JWE ----
+	// ---- Refresh claims -> signed JWT -> JWE ----
 	rid := uuid.NewString()
 	fid := uuid.NewString()
 	refreshJti := uuid.NewString()
@@ -146,6 +146,8 @@ func IssueAccessAndRefreshJWEWithClaimsCustom(
 	accessTTL, refreshTTL time.Duration,
 	scope []string,
 	pre func(*AccessCustomClaims, *RefreshCustomClaims) error,
+	accessExtra map[string]interface{},
+	refreshExtra map[string]interface{},
 ) (accessJWE, refreshJWE string, accessClaims AccessCustomClaims, refreshClaims RefreshCustomClaims, err error) {
 	now := time.Now()
 
@@ -197,7 +199,7 @@ func IssueAccessAndRefreshJWEWithClaimsCustom(
 		}
 	}
 
-	innerAccessJWS, err := signJWT(signPriv, signKid, algs.SignAlg, accessClaims)
+	innerAccessJWS, err := signJWTWithExtra(signPriv, signKid, algs.SignAlg, accessClaims, accessExtra)
 	if err != nil {
 		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
@@ -205,7 +207,7 @@ func IssueAccessAndRefreshJWEWithClaimsCustom(
 	if err != nil {
 		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
-	innerRefreshJWS, err := signJWT(signPriv, signKid, algs.SignAlg, refreshClaims)
+	innerRefreshJWS, err := signJWTWithExtra(signPriv, signKid, algs.SignAlg, refreshClaims, refreshExtra)
 	if err != nil {
 		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}

@@ -106,6 +106,20 @@ func WithPreSignClaims(mut func(context.Context, *AccessCustomClaims, *RefreshCu
 	}
 }
 
+// WithPreSignAccessExtra sets extra top-level fields to embed into the access JWT before signing.
+func WithPreSignAccessExtra(extra map[string]interface{}) IssueOption {
+	return func(p *IssueAndStoreParams) {
+		p.PreSignAccessExtra = extra
+	}
+}
+
+// WithPreSignRefreshExtra sets extra top-level fields to embed into the refresh JWT before signing.
+func WithPreSignRefreshExtra(extra map[string]interface{}) IssueOption {
+	return func(p *IssueAndStoreParams) {
+		p.PreSignRefreshExtra = extra
+	}
+}
+
 // WithRefreshPayload sets an externalized payload object to be stored alongside
 // the refresh RID in the same transaction and TTL when supported by the store.
 func WithRefreshPayload(payload interface{}) IssueOption {

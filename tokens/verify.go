@@ -9,7 +9,7 @@ import (
 	"github.com/go-jose/go-jose/v3/jwt"
 )
 
-// DecryptAndVerifyAccess decrypts JWE -> verifies inner JWS -> returns parsed AccessCustomClaims
+// DecryptAndVerifyAccess decrypts JWE -> verifies inner signed JWT -> returns parsed AccessCustomClaims
 func DecryptAndVerifyAccess(
 	tokenJWE string,
 	encPrivKey interface{},
