@@ -97,6 +97,23 @@ func WithDeviceIndex(dstore DeviceIndexStore) IssueOption {
 	}
 }
 
+// WithPreSignClaims customizes access/refresh claims BEFORE they are signed,
+// allowing you to embed additional fields into the tokens. Do not modify
+// JTI/RID/FID.
+func WithPreSignClaims(mut func(context.Context, *AccessCustomClaims, *RefreshCustomClaims) error) IssueOption {
+	return func(p *IssueAndStoreParams) {
+		p.PreSignClaimsMutator = mut
+	}
+}
+
+// WithRefreshPayload sets an externalized payload object to be stored alongside
+// the refresh RID in the same transaction and TTL when supported by the store.
+func WithRefreshPayload(payload interface{}) IssueOption {
+	return func(p *IssueAndStoreParams) {
+		p.RefreshPayload = payload
+	}
+}
+
 // Issue is the functional-options entrypoint to issue and persist tokens.
 // Required: store, keys (WithKeys), iss/aud (WithAudience), uid (WithSubject), TTLs (WithTTL).
 // Optional: sub (defaults to uid), device/client/scope/allow-multi-user/force replace/device index.

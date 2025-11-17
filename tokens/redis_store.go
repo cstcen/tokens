@@ -194,6 +194,21 @@ type DeviceIndexStore interface {
 	RemoveUserDevice(ctx context.Context, uid, deviceID string) error
 }
 
+// PayloadStore exposes helpers to store large, out-of-token payloads keyed by
+// token identifiers to keep JWT/JWE minimal in size. Implemented by RedisTokenStore.
+type PayloadStore interface {
+	// Refresh payload helpers (keyed by RID)
+	SaveRefreshPayload(ctx context.Context, rid string, v interface{}, ttl time.Duration) error
+	GetRefreshPayloadJSON(ctx context.Context, rid string) ([]byte, bool, error)
+}
+
+// RefreshPayloadTxnStore exposes an atomic save that writes refresh artifacts and
+// its externalized payload in a single Redis transaction with identical TTLs.
+// Implemented by RedisTokenStore.
+type RefreshPayloadTxnStore interface {
+	SaveRefreshWithPayload(ctx context.Context, rid, fid string, claims RefreshCustomClaims, payload interface{}, ttl time.Duration) error
+}
+
 func (s *RedisTokenStore) deviceKey(uid, deviceID string) string {
 	// Key: prefix + "uxd:" + uid + "|" + deviceID
 	return s.key("uxd:", uid, "|", deviceID)
@@ -291,6 +306,51 @@ func (s *RedisTokenStore) AddUserDevice(ctx context.Context, uid, deviceID strin
 
 func (s *RedisTokenStore) RemoveUserDevice(ctx context.Context, uid, deviceID string) error {
 	return s.rdb.SRem(ctx, s.userDevicesKey(uid), deviceID).Err()
+}
+
+// ------ Large payload externalization (keep tokens minimal) ------
+
+func (s *RedisTokenStore) refreshPayloadKey(rid string) string { return s.key("pl:r:", rid) }
+
+// SaveRefreshPayload stores arbitrary JSON-serializable payload keyed by refresh RID.
+func (s *RedisTokenStore) SaveRefreshPayload(ctx context.Context, rid string, v interface{}, ttl time.Duration) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return s.rdb.Set(ctx, s.refreshPayloadKey(rid), b, ttl).Err()
+}
+
+// GetRefreshPayloadJSON returns raw JSON payload for RID if present.
+func (s *RedisTokenStore) GetRefreshPayloadJSON(ctx context.Context, rid string) ([]byte, bool, error) {
+	res, err := s.rdb.Get(ctx, s.refreshPayloadKey(rid)).Bytes()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return res, true, nil
+}
+
+// SaveRefreshWithPayload stores refresh claims, the FID->RID mapping, and an external payload
+// for the refresh RID in a single transaction with the same TTL.
+func (s *RedisTokenStore) SaveRefreshWithPayload(ctx context.Context, rid, fid string, claims RefreshCustomClaims, payload interface{}, ttl time.Duration) error {
+	rb, err := json.Marshal(claims)
+	if err != nil {
+		return err
+	}
+	pb, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = s.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.Set(ctx, s.key("rtk:", rid), rb, ttl)
+		pipe.Set(ctx, s.key("fid:", fid), rid, ttl)
+		pipe.Set(ctx, s.refreshPayloadKey(rid), pb, ttl)
+		return nil
+	})
+	return err
 }
 
 // Helper: TTL remaining from claims' exp (clamped to >=0 and at most maxTTL if >0)

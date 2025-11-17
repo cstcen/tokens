@@ -4,6 +4,8 @@ import (
 	"crypto/ecdsa"
 	"time"
 
+	"errors"
+
 	jose "github.com/go-jose/go-jose/v3"
 	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/uuid"
@@ -128,5 +130,88 @@ func IssueAccessAndRefreshJWEWithClaims(
 		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
 	}
 
+	return accessJWE, refreshJWE, accessClaims, refreshClaims, nil
+}
+
+// IssueAccessAndRefreshJWEWithClaimsCustom is like IssueAccessAndRefreshJWEWithClaims but allows
+// callers to mutate the access/refresh claims BEFORE signing so that custom fields are embedded
+// in the tokens. The mutator must not change JTI (access.Claims.ID), RID or FID.
+func IssueAccessAndRefreshJWEWithClaimsCustom(
+	signKid string,
+	signPriv *ecdsa.PrivateKey,
+	encKid string,
+	encPubKey interface{},
+	algs KeyAlgs,
+	iss, aud, sub, uid, deviceID, clientID string,
+	accessTTL, refreshTTL time.Duration,
+	scope []string,
+	pre func(*AccessCustomClaims, *RefreshCustomClaims) error,
+) (accessJWE, refreshJWE string, accessClaims AccessCustomClaims, refreshClaims RefreshCustomClaims, err error) {
+	now := time.Now()
+
+	// Build defaults
+	accessJti := uuid.NewString()
+	accessClaims = AccessCustomClaims{
+		Scope:    scope,
+		DeviceID: deviceID,
+		ClientID: clientID,
+		Claims: jwt.Claims{
+			Issuer:    iss,
+			Subject:   sub,
+			Audience:  jwt.Audience{aud},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now.Add(-60 * time.Second)),
+			Expiry:    jwt.NewNumericDate(now.Add(accessTTL)),
+			ID:        accessJti,
+		},
+	}
+	rid := uuid.NewString()
+	fid := uuid.NewString()
+	refreshJti := uuid.NewString()
+	refreshClaims = RefreshCustomClaims{
+		RID:      rid,
+		FID:      fid,
+		UID:      uid,
+		DeviceID: deviceID,
+		ClientID: clientID,
+		Scope:    scope,
+		Claims: jwt.Claims{
+			Issuer:    iss,
+			Subject:   uid,
+			Audience:  jwt.Audience{aud},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now.Add(-60 * time.Second)),
+			Expiry:    jwt.NewNumericDate(now.Add(refreshTTL)),
+			ID:        refreshJti,
+		},
+	}
+	if pre != nil {
+		origAJTI := accessClaims.Claims.ID
+		origRID := refreshClaims.RID
+		origFID := refreshClaims.FID
+		if mErr := pre(&accessClaims, &refreshClaims); mErr != nil {
+			return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, mErr
+		}
+		if accessClaims.Claims.ID != origAJTI || refreshClaims.RID != origRID || refreshClaims.FID != origFID {
+			return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, errors.New("pre-sign claims mutator cannot change JTI/RID/FID")
+		}
+	}
+
+	innerAccessJWS, err := signJWT(signPriv, signKid, algs.SignAlg, accessClaims)
+	if err != nil {
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
+	}
+	accessJWE, err = encryptAsJWE(innerAccessJWS, encKid, encPubKey, algs.KeyMgmtAlg, algs.ContentEncryption)
+	if err != nil {
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
+	}
+	innerRefreshJWS, err := signJWT(signPriv, signKid, algs.SignAlg, refreshClaims)
+	if err != nil {
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
+	}
+	refreshJWE, err = encryptAsJWE(innerRefreshJWS, encKid, encPubKey, algs.KeyMgmtAlg, algs.ContentEncryption)
+	if err != nil {
+		return "", "", AccessCustomClaims{}, RefreshCustomClaims{}, err
+	}
 	return accessJWE, refreshJWE, accessClaims, refreshClaims, nil
 }

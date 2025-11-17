@@ -7,12 +7,6 @@ import (
 	"time"
 )
 
-// DevicePolicy removed: behavior is now controlled by explicit options on IssueOptions.
-
-// Custom handlers have been removed in favor of explicit policies + ForceReplace flag.
-
-// Outcome telemetry removed; callers can infer from Err and helper booleans.
-
 // IssueResult captures side-effects and outcomes during issuing.
 type IssueResult struct {
 	OldRID string
@@ -77,6 +71,13 @@ type IssueAndStoreParams struct {
 	// Optional: mutate claims before saving to store/cache.
 	// Do NOT change access.Claims.ID (JTI), refresh.RID or refresh.FID.
 	ClaimsMutator func(context.Context, *AccessCustomClaims, *RefreshCustomClaims) error
+	// Optional: mutate claims BEFORE signing so custom fields are embedded in tokens.
+	// MUST NOT change identifiers: access.Claims.ID (JTI), refresh.RID, refresh.FID.
+	PreSignClaimsMutator func(context.Context, *AccessCustomClaims, *RefreshCustomClaims) error
+	// Optional: externalized payload associated with refresh RID.
+	// When provided and the store supports atomic writes, it will be saved in the
+	// same Redis transaction and with the same TTL as the RID/FID records.
+	RefreshPayload interface{}
 }
 
 // IssueAndStore issues and persists tokens according to provided params, enforcing device policy.
@@ -182,14 +183,28 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 	var accessJWE, refreshJWE string
 	var accessClaims AccessCustomClaims
 	var refreshClaims RefreshCustomClaims
-	accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaims(
-		p.In.SignKid, p.In.SignPriv,
-		p.In.EncKid, p.In.EncPubKey,
-		p.In.Algs,
-		p.In.Iss, p.In.Aud, p.In.Sub, p.In.UID, p.In.DeviceID, p.In.ClientID,
-		p.In.AccessTTL, p.In.RefreshTTL,
-		p.In.Scope,
-	)
+	if p.PreSignClaimsMutator != nil {
+		accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaimsCustom(
+			p.In.SignKid, p.In.SignPriv,
+			p.In.EncKid, p.In.EncPubKey,
+			p.In.Algs,
+			p.In.Iss, p.In.Aud, p.In.Sub, p.In.UID, p.In.DeviceID, p.In.ClientID,
+			p.In.AccessTTL, p.In.RefreshTTL,
+			p.In.Scope,
+			func(ac *AccessCustomClaims, rc *RefreshCustomClaims) error {
+				return p.PreSignClaimsMutator(ctx, ac, rc)
+			},
+		)
+	} else {
+		accessJWE, refreshJWE, accessClaims, refreshClaims, res.Err = IssueAccessAndRefreshJWEWithClaims(
+			p.In.SignKid, p.In.SignPriv,
+			p.In.EncKid, p.In.EncPubKey,
+			p.In.Algs,
+			p.In.Iss, p.In.Aud, p.In.Sub, p.In.UID, p.In.DeviceID, p.In.ClientID,
+			p.In.AccessTTL, p.In.RefreshTTL,
+			p.In.Scope,
+		)
+	}
 	if res.Err != nil {
 		return
 	}
@@ -223,9 +238,29 @@ func IssueAndStore(p IssueAndStoreParams) (res IssueResult) {
 
 	// Persist (compute TTL after potential mutation)
 	rTTL := ttlFromExpiry(refreshClaims.Claims.Expiry.Time(), 0)
-	// Refresh-only persistence: only save refresh + fid mapping
-	if res.Err = p.Store.SaveRefresh(ctx, refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL); res.Err != nil {
-		return
+	// Refresh persistence: save refresh + fid mapping (+ optional payload)
+	if p.RefreshPayload != nil {
+		if txStore, ok := p.Store.(interface {
+			SaveRefreshWithPayload(context.Context, string, string, RefreshCustomClaims, interface{}, time.Duration) error
+		}); ok {
+			if res.Err = txStore.SaveRefreshWithPayload(ctx, refreshClaims.RID, refreshClaims.FID, refreshClaims, p.RefreshPayload, rTTL); res.Err != nil {
+				return
+			}
+		} else {
+			// Fallback (non-atomic with respect to payload)
+			if res.Err = p.Store.SaveRefresh(ctx, refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL); res.Err != nil {
+				return
+			}
+			if ps, ok := p.Store.(PayloadStore); ok {
+				// Best-effort same TTL
+				_ = ps.SaveRefreshPayload(ctx, refreshClaims.RID, p.RefreshPayload, rTTL)
+			}
+		}
+	} else {
+		// No payload: just save refresh + fid mapping
+		if res.Err = p.Store.SaveRefresh(ctx, refreshClaims.RID, refreshClaims.FID, refreshClaims, rTTL); res.Err != nil {
+			return
+		}
 	}
 	if p.DStore != nil && p.In.DeviceID != "" {
 		// Maintain per-user mapping for refresh validation
