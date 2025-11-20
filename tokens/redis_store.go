@@ -127,11 +127,28 @@ func (s *RedisTokenStore) RotateRefreshAtomic(
 	if err != nil {
 		return err
 	}
+	// Attempt to load old external payload (if any) for migration.
+	var oldPayload []byte
+	oldPayloadFound := false
+	if oldRID != "" {
+		if b, gerr := s.rdb.Get(ctx, s.refreshPayloadKey(oldRID)).Bytes(); gerr == nil {
+			oldPayload = b
+			oldPayloadFound = true
+		}
+	}
 	_, err = s.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		// New refresh claims + FID mapping
 		pipe.Set(ctx, s.key("rtk:", newRRID), rb, newRTTL)
 		pipe.Set(ctx, s.key("fid:", fid), newRRID, newRTTL)
+		// Delete old refresh claims
 		pipe.Del(ctx, s.key("rtk:", oldRID))
+		// Tombstone old RID
 		pipe.Set(ctx, s.key("rev:r:", oldRID), "1", oldTTL)
+		// Migrate external payload: copy to new RID with new TTL and delete old key
+		if oldPayloadFound {
+			pipe.Set(ctx, s.refreshPayloadKey(newRRID), oldPayload, newRTTL)
+			pipe.Del(ctx, s.refreshPayloadKey(oldRID))
+		}
 		return nil
 	})
 	return err

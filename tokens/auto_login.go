@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -42,6 +43,11 @@ type AutoLoginParams struct {
 
 	// Optional: refresh extra payload stored via PayloadStore (not embedded).
 	RefreshExtra map[string]interface{}
+
+	// Optional: mutator applied to existing externalized refresh payload BEFORE rotation.
+	// If provided and store supports PayloadStore, the current payload is loaded (if any),
+	// passed to mutator (map representation), then the result is saved for the new RID.
+	RefreshPayloadMutator func(context.Context, map[string]interface{}) error
 }
 
 // WithAutoStore sets the TokenStore (optional; when present enables rotation persistence and cache checks).
@@ -112,6 +118,12 @@ func WithAutoUIDValidator(f func(context.Context, string) error) AutoLoginOption
 // WithAutoPreSignRefreshExtra sets extra fields for the new refresh JWT (cached only).
 func WithAutoPreSignRefreshExtra(extra map[string]interface{}) AutoLoginOption {
 	return func(p *AutoLoginParams) { p.RefreshExtra = extra }
+}
+
+// WithAutoRefreshPayloadMutator sets a mutator to transform existing externalized payload.
+// Ignored if the store does not implement PayloadStore.
+func WithAutoRefreshPayloadMutator(mut func(context.Context, map[string]interface{}) error) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.RefreshPayloadMutator = mut }
 }
 
 // AutoLoginWithRefresh verifies a refresh token, rotates state (when store provided), and issues new tokens.
@@ -221,9 +233,32 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 			newRC.RID, newRC.FID, newRC, rTTL,
 		)
 		// No parsed claims cache; rely on direct verification on future use.
-		// Store/replace externalized refresh payload for the new RID, if provided
-		if ps, ok := p.Store.(PayloadStore); ok && p.RefreshExtra != nil {
-			_ = ps.SaveRefreshPayload(ctx, newRC.RID, p.RefreshExtra, rTTL)
+		// Externalized payload handling (mutator > explicit extra > copy existing)
+		if ps, ok := p.Store.(PayloadStore); ok {
+			var toSave interface{}
+			// Load existing payload (best-effort)
+			oldRaw, oldFound, _ := ps.GetRefreshPayloadJSON(ctx, rc.RID)
+			if p.RefreshPayloadMutator != nil {
+				m := map[string]interface{}{}
+				if oldFound && oldRaw != nil {
+					_ = json.Unmarshal(oldRaw, &m)
+				}
+				if err := p.RefreshPayloadMutator(ctx, m); err == nil { // ignore mutator error silently or could assign err
+					toSave = m
+				}
+			}
+			if toSave == nil && p.RefreshExtra != nil {
+				toSave = p.RefreshExtra
+			}
+			if toSave == nil && oldFound {
+				// carry forward previous payload unchanged
+				var prev interface{}
+				_ = json.Unmarshal(oldRaw, &prev)
+				toSave = prev
+			}
+			if toSave != nil {
+				_ = ps.SaveRefreshPayload(ctx, newRC.RID, toSave, rTTL)
+			}
 		}
 		// Update per-user device mapping to the new RID if device info present
 		if rs, ok := p.Store.(DeviceIndexStore); ok {
