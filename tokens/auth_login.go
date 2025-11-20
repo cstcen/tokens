@@ -28,8 +28,7 @@ type AuthLoginParams struct {
 
 	UIDValidator func(context.Context, string) error
 
-	// Optional: extra top-level fields to embed into the signed JWTs at issuance time.
-	PreSignAccessExtra  map[string]interface{}
+	// Optional: refresh extra JSON to cache (not embedded into JWTs).
 	PreSignRefreshExtra map[string]interface{}
 }
 
@@ -43,12 +42,7 @@ func WithAuthIssueOptions(opts ...IssueOption) AuthLoginOption {
 	return func(p *AuthLoginParams) { p.IssueOps = append(p.IssueOps, opts...) }
 }
 
-// WithAuthPreSignAccessExtra sets extra fields for the access JWT.
-func WithAuthPreSignAccessExtra(extra map[string]interface{}) AuthLoginOption {
-	return func(p *AuthLoginParams) { p.PreSignAccessExtra = extra }
-}
-
-// WithAuthPreSignRefreshExtra sets extra fields for the refresh JWT.
+// WithAuthPreSignRefreshExtra sets extra JSON cached with refresh claims (not embedded).
 func WithAuthPreSignRefreshExtra(extra map[string]interface{}) AuthLoginOption {
 	return func(p *AuthLoginParams) { p.PreSignRefreshExtra = extra }
 }
@@ -120,11 +114,20 @@ func AuthLogin(ctx context.Context, opts ...AuthLoginOption) (res IssueResult) {
 	// Append TTL and call Issue
 	issueOps := append([]IssueOption{}, p.IssueOps...)
 	issueOps = append(issueOps, WithTTL(aTTL, rTTL))
-	if p.PreSignAccessExtra != nil {
-		issueOps = append(issueOps, WithPreSignAccessExtra(p.PreSignAccessExtra))
+	res = Issue(ctx, p.Store, issueOps...)
+	if res.Err != nil {
+		return res
 	}
-	if p.PreSignRefreshExtra != nil {
-		issueOps = append(issueOps, WithPreSignRefreshExtra(p.PreSignRefreshExtra))
+	// Cache refresh claims with Extra JSON to avoid enlarging JWT.
+	if p.Store != nil && p.PreSignRefreshExtra != nil {
+		rc := res.RefreshClaims
+		rc.Extra = p.PreSignRefreshExtra
+		ttl := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
+		if ttl > 0 {
+			_ = p.Store.CacheRefreshClaims(ctx, res.RefreshJWE, rc, ttl)
+		}
+		// reflect Extra back to result for caller convenience
+		res.RefreshClaims = rc
 	}
-	return Issue(ctx, p.Store, issueOps...)
+	return res
 }

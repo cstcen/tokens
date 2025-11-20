@@ -40,8 +40,7 @@ type AutoLoginParams struct {
 	// Return ErrUserLoginForbidden (or any error) to block auto login.
 	UIDValidator func(context.Context, string) error
 
-	// Optional: extra top-level fields to embed into newly issued signed JWTs.
-	AccessExtra  map[string]interface{}
+	// Optional: refresh extra fields cached (not embedded) to reduce JWT size.
 	RefreshExtra map[string]interface{}
 }
 
@@ -110,12 +109,7 @@ func WithAutoUIDValidator(f func(context.Context, string) error) AutoLoginOption
 	return func(p *AutoLoginParams) { p.UIDValidator = f }
 }
 
-// WithAutoPreSignAccessExtra sets extra fields for the new access JWT.
-func WithAutoPreSignAccessExtra(extra map[string]interface{}) AutoLoginOption {
-	return func(p *AutoLoginParams) { p.AccessExtra = extra }
-}
-
-// WithAutoPreSignRefreshExtra sets extra fields for the new refresh JWT.
+// WithAutoPreSignRefreshExtra sets extra fields for the new refresh JWT (cached only).
 func WithAutoPreSignRefreshExtra(extra map[string]interface{}) AutoLoginOption {
 	return func(p *AutoLoginParams) { p.RefreshExtra = extra }
 }
@@ -204,16 +198,13 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		return
 	}
 
-	accessJWE, refreshJWE, ac, newRC, err := IssueAccessAndRefreshJWEWithClaimsCustom(
+	accessJWE, refreshJWE, ac, newRC, err := IssueAccessAndRefreshJWEWithClaims(
 		p.SignKid, p.SignPriv,
 		p.EncKid, p.EncPubKey,
 		p.Algs,
 		rc.Claims.Issuer, rc.Claims.Audience[0], rc.UID, rc.UID, rc.DeviceID, rc.ClientID,
 		accessTTL, refreshTTL,
 		rc.Scope,
-		nil,
-		p.AccessExtra,
-		p.RefreshExtra,
 	)
 	if err != nil {
 		return
@@ -237,6 +228,10 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 			newRC.RID, newRC.FID, newRC, rTTL,
 		)
 		if rTTL > 0 {
+			// Attach refresh extra only in cache to avoid enlarging JWT size
+			if p.RefreshExtra != nil {
+				newRC.Extra = p.RefreshExtra
+			}
 			_ = p.Store.CacheRefreshClaims(ctx, refreshJWE, newRC, rTTL)
 		}
 		// Update per-user device mapping to the new RID if device info present

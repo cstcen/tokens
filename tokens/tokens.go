@@ -27,6 +27,10 @@ type RefreshCustomClaims struct {
 	DeviceID string   `json:"device_id,omitempty"`
 	ClientID string   `json:"client_id,omitempty"`
 	Scope    []string `json:"scope,omitempty"`
+	// Extra holds additional large or optional fields that should NOT be embedded
+	// into the signed JWT to keep token size minimal. It is intended for caching
+	// (e.g., via CacheRefreshClaims) or externalization only.
+	Extra map[string]interface{} `json:"extra,omitempty"`
 	jwt.Claims
 }
 

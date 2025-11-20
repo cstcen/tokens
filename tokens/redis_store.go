@@ -145,6 +145,7 @@ func (s *RedisTokenStore) CacheRefreshClaims(ctx context.Context, token string, 
 	if err != nil {
 		return err
 	}
+	// Primary key (backwards-compatible): hash of the token for quick lookup without decrypting.
 	return s.rdb.Set(ctx, s.key("rc-cache:", hashToken(token)), b, ttl).Err()
 }
 
@@ -162,6 +163,8 @@ func (s *RedisTokenStore) GetCachedRefresh(ctx context.Context, token string) (R
 	}
 	return out, true, nil
 }
+
+// (UID-based cache helpers removed; token-hash cache only)
 
 // IsAccessRevoked checks if an access JTI has a revocation tombstone.
 func (s *RedisTokenStore) IsAccessRevoked(ctx context.Context, jti string) (bool, error) {
