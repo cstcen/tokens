@@ -156,9 +156,7 @@ func main() {
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": res.Err.Error()})
 				return
 			}
-			if res.RefreshClaims.Claims.Expiry != nil {
-				_ = store.CacheRefreshClaims(r.Context(), res.RefreshJWE, res.RefreshClaims, time.Until(res.RefreshClaims.Claims.Expiry.Time()))
-			}
+			// Parsed refresh caching removed; rely on direct decrypt/verify when needed.
 			_ = json.NewEncoder(w).Encode(issueResp{AccessJWE: res.AccessJWE, RefreshJWE: res.RefreshJWE})
 			return
 		}
@@ -290,12 +288,6 @@ func main() {
 
 		switch req.Type {
 		case "refresh":
-			if store != nil {
-				if cached, ok, _ := store.GetCachedRefresh(r.Context(), req.Token); ok {
-					_ = json.NewEncoder(w).Encode(verifyResp{Valid: true, Claims: cached})
-					return
-				}
-			}
 			claims, err := tokens.DecryptAndVerifyRefresh(req.Token, encPriv, findSigKeyByKID, req.Iss, req.Aud)
 			if err != nil {
 				_ = json.NewEncoder(w).Encode(verifyResp{Valid: false, Error: err.Error()})
@@ -305,9 +297,6 @@ func main() {
 				if _, found, _ := store.GetRefresh(r.Context(), claims.RID); !found {
 					_ = json.NewEncoder(w).Encode(verifyResp{Valid: false, Error: "revoked or not found"})
 					return
-				}
-				if claims.Claims.Expiry != nil {
-					_ = store.CacheRefreshClaims(r.Context(), req.Token, claims, time.Until(claims.Claims.Expiry.Time()))
 				}
 			}
 			_ = json.NewEncoder(w).Encode(verifyResp{Valid: true, Claims: claims})
@@ -376,20 +365,12 @@ func main() {
 		}
 
 		// Cache-first for refresh claims
-		var rc tokens.RefreshCustomClaims
-		var err error
-		if store != nil {
-			if cached, ok, _ := store.GetCachedRefresh(r.Context(), req.Token); ok {
-				rc = cached
-			}
-		}
-		if rc.RID == "" {
-			rc, err = tokens.DecryptAndVerifyRefresh(req.Token, encPriv, findSigKeyByKID, req.Iss, req.Aud)
-			if err != nil {
-				w.WriteHeader(http.StatusUnauthorized)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-				return
-			}
+		// Always decrypt & verify refresh (no parsed cache layer)
+		rc, err := tokens.DecryptAndVerifyRefresh(req.Token, encPriv, findSigKeyByKID, req.Iss, req.Aud)
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
 		}
 		// State checks
 		if store != nil {
@@ -436,9 +417,7 @@ func main() {
 				rc.RID, oldTTL,
 				rfClaims.RID, rfClaims.FID, rfClaims, rTTL,
 			)
-			if rTTL > 0 {
-				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, rTTL)
-			}
+			// No parsed claims cache; external payload handled separately if used.
 		}
 		_ = json.NewEncoder(w).Encode(refreshResp{AccessJWE: acJWE, RefreshJWE: rfJWE})
 	})
@@ -562,9 +541,7 @@ func main() {
 				rc.RID, oldTTL,
 				rfClaims.RID, rfClaims.FID, rfClaims, rTTL,
 			)
-			if rTTL > 0 {
-				_ = store.CacheRefreshClaims(r.Context(), rfJWE, rfClaims, rTTL)
-			}
+			// No parsed claims cache; external payload handled separately if used.
 			// Update device mapping to new RID (keep device single-active on new refresh)
 			if dstore != nil && rc.DeviceID != "" && rc.UID != "" && rTTL > 0 {
 				_ = dstore.SetDeviceRID(r.Context(), rc.UID, rc.DeviceID, rfClaims.RID, rTTL)

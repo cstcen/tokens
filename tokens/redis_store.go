@@ -30,21 +30,19 @@ type TokenStore interface {
 
 	// Access blacklist query
 	IsAccessRevoked(ctx context.Context, jti string) (bool, error)
-
-	// Cache helpers to avoid repeated JWE decrypt/verify for the same token during its lifetime
-	CacheRefreshClaims(ctx context.Context, token string, claims RefreshCustomClaims, ttl time.Duration) error
-	GetCachedRefresh(ctx context.Context, token string) (RefreshCustomClaims, bool, error)
 }
 
 // RedisTokenStore is a Redis-backed implementation.
 // Key schema (with configurable prefix p):
 //
-//	p+"rtk:"+rid     -> JSON(RefreshCustomClaims)  EX=ttl
-//	p+"fid:"+fid     -> rid                         EX=ttl (to check one-time use / rotation)
-//	p+"rev:a:"+jti   -> "1"                        EX=ttl (access revocation tombstone)
-//	p+"rev:r:"+rid   -> "1"                        EX=ttl (refresh revocation tombstone)
-//	p+"rc-cache:"+H  -> JSON(RefreshCustomClaims)  EX=ttl (parsed token cache)
-//	p+"uxd:"+uid+"|"+deviceID -> rid            EX=ttl (current session mapping per user+device)
+// p+"rtk:"+rid            -> JSON(RefreshCustomClaims)          EX=ttl (authoritative refresh claims)
+// p+"fid:"+fid            -> rid                                EX=ttl (family mapping: current RID for FID)
+// p+"rev:a:"+jti          -> "1"                               EX=ttl (access revocation tombstone by JTI)
+// p+"rev:r:"+rid          -> "1"                               EX=ttl (refresh revocation tombstone by RID)
+// p+"uxd:"+uid+"|"+device -> rid                                EX=ttl (per-user per-device active RID)
+// p+"xd:"+deviceID        -> JSON({uid,rid})                     EX=ttl (device occupant when multi-user disabled)
+// p+"uxds:"+uid           -> Set(deviceIDs)                      (no TTL; logical index of devices for user)
+// p+"pl:r:"+rid           -> JSON(external payload)              EX=ttl (refresh externalized payload/extra)
 type RedisTokenStore struct {
 	rdb    redis.UniversalClient
 	prefix string
@@ -139,32 +137,7 @@ func (s *RedisTokenStore) RotateRefreshAtomic(
 	return err
 }
 
-// CacheRefreshClaims caches parsed refresh claims keyed by hash(token) with TTL.
-func (s *RedisTokenStore) CacheRefreshClaims(ctx context.Context, token string, claims RefreshCustomClaims, ttl time.Duration) error {
-	b, err := json.Marshal(claims)
-	if err != nil {
-		return err
-	}
-	// Primary key (backwards-compatible): hash of the token for quick lookup without decrypting.
-	return s.rdb.Set(ctx, s.key("rc-cache:", hashToken(token)), b, ttl).Err()
-}
-
-func (s *RedisTokenStore) GetCachedRefresh(ctx context.Context, token string) (RefreshCustomClaims, bool, error) {
-	var out RefreshCustomClaims
-	res, err := s.rdb.Get(ctx, s.key("rc-cache:", hashToken(token))).Bytes()
-	if err == redis.Nil {
-		return out, false, nil
-	}
-	if err != nil {
-		return out, false, err
-	}
-	if err := json.Unmarshal(res, &out); err != nil {
-		return out, false, err
-	}
-	return out, true, nil
-}
-
-// (UID-based cache helpers removed; token-hash cache only)
+// (Parsed token cache removed; rely on direct decrypt/verify + authoritative RID records)
 
 // IsAccessRevoked checks if an access JTI has a revocation tombstone.
 func (s *RedisTokenStore) IsAccessRevoked(ctx context.Context, jti string) (bool, error) {

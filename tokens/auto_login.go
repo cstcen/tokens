@@ -156,17 +156,10 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		return
 	}
 
-	// Try cache first when store available
-	if p.Store != nil {
-		if cached, ok, _ := p.Store.GetCachedRefresh(ctx, p.RefreshToken); ok {
-			rc = cached
-		}
-	}
-	if rc.RID == "" {
-		rc, err = DecryptAndVerifyRefresh(p.RefreshToken, p.EncPrivKey, p.FindSigKeyByKID, p.Iss, p.Aud)
-		if err != nil {
-			return
-		}
+	// Always decrypt & verify refresh token (no in-Redis parsed cache)
+	rc, err = DecryptAndVerifyRefresh(p.RefreshToken, p.EncPrivKey, p.FindSigKeyByKID, p.Iss, p.Aud)
+	if err != nil {
+		return
 	}
 
 	// Optional state checks when Redis available
@@ -227,9 +220,7 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 			rc.RID, oldTTL,
 			newRC.RID, newRC.FID, newRC, rTTL,
 		)
-		if rTTL > 0 {
-			_ = p.Store.CacheRefreshClaims(ctx, refreshJWE, newRC, rTTL)
-		}
+		// No parsed claims cache; rely on direct verification on future use.
 		// Store/replace externalized refresh payload for the new RID, if provided
 		if ps, ok := p.Store.(PayloadStore); ok && p.RefreshExtra != nil {
 			_ = ps.SaveRefreshPayload(ctx, newRC.RID, p.RefreshExtra, rTTL)

@@ -43,12 +43,8 @@ func (s *simpleStore) RotateRefreshAtomic(ctx context.Context, oldRID string, ol
 	delete(s.R, oldRID)
 	return nil
 }
-func (s *simpleStore) CacheRefreshClaims(ctx context.Context, token string, claims RefreshCustomClaims, ttl time.Duration) error {
-	return nil
-}
-func (s *simpleStore) GetCachedRefresh(ctx context.Context, token string) (RefreshCustomClaims, bool, error) {
-	return RefreshCustomClaims{}, false, nil
-}
+
+// Removed cache methods; test store implements only required TokenStore subset.
 func (s *simpleStore) IsAccessRevoked(ctx context.Context, jti string) (bool, error) {
 	return false, nil
 }
