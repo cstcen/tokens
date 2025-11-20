@@ -127,7 +127,29 @@ func WithAutoRefreshPayloadMutator(mut func(context.Context, map[string]interfac
 }
 
 // AutoLoginWithRefresh verifies a refresh token, rotates state (when store provided), and issues new tokens.
-func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJWE string, refreshJWE string, ac AccessCustomClaims, rc RefreshCustomClaims, err error) {
+// AutoLoginPayloadInfo describes the externalized refresh payload state after rotation.
+// Source indicates how the payload was determined: "mutator" | "extra" | "carry-forward" | "migrated" | "none".
+type AutoLoginPayloadInfo struct {
+	Found   bool   `json:"found"`
+	Mutated bool   `json:"mutated"`
+	Source  string `json:"source"`
+	RawJSON []byte `json:"raw_json,omitempty"`
+	// Raw holds the original payload bytes from the previous refresh RID before any mutator/override.
+	// If no previous payload existed, Raw will be empty. RawJSON always reflects the final payload stored for the new RID.
+	Raw  []byte                 `json:"raw,omitempty"`
+	Data map[string]interface{} `json:"data,omitempty"`
+}
+
+// AutoLoginResult consolidates all outputs of AutoLoginWithRefresh.
+type AutoLoginResult struct {
+	AccessJWE     string               `json:"access_jwe"`
+	RefreshJWE    string               `json:"refresh_jwe"`
+	AccessClaims  AccessCustomClaims   `json:"access_claims"`
+	RefreshClaims RefreshCustomClaims  `json:"refresh_claims"`
+	Payload       AutoLoginPayloadInfo `json:"payload"`
+}
+
+func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (res AutoLoginResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -169,6 +191,7 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 	}
 
 	// Always decrypt & verify refresh token (no in-Redis parsed cache)
+	var rc RefreshCustomClaims
 	rc, err = DecryptAndVerifyRefresh(p.RefreshToken, p.EncPrivKey, p.FindSigKeyByKID, p.Iss, p.Aud)
 	if err != nil {
 		return
@@ -236,29 +259,43 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		// Externalized payload handling (mutator > explicit extra > copy existing)
 		if ps, ok := p.Store.(PayloadStore); ok {
 			var toSave interface{}
-			// Load existing payload (best-effort)
+			payloadInfo := AutoLoginPayloadInfo{Found: false, Mutated: false, Source: "none"}
+			// Load existing payload (original from OLD RID)
 			oldRaw, oldFound, _ := ps.GetRefreshPayloadJSON(ctx, rc.RID)
+			if oldFound && oldRaw != nil {
+				payloadInfo.Found = true
+				payloadInfo.Source = "migrated" // default before override
+				payloadInfo.Raw = oldRaw
+			}
 			if p.RefreshPayloadMutator != nil {
 				m := map[string]interface{}{}
 				if oldFound && oldRaw != nil {
 					_ = json.Unmarshal(oldRaw, &m)
 				}
-				if err := p.RefreshPayloadMutator(ctx, m); err == nil { // ignore mutator error silently or could assign err
+				if mErr := p.RefreshPayloadMutator(ctx, m); mErr == nil {
 					toSave = m
+					payloadInfo.Mutated = true
+					payloadInfo.Source = "mutator"
 				}
 			}
 			if toSave == nil && p.RefreshExtra != nil {
 				toSave = p.RefreshExtra
+				payloadInfo.Source = "extra"
 			}
 			if toSave == nil && oldFound {
-				// carry forward previous payload unchanged
-				var prev interface{}
-				_ = json.Unmarshal(oldRaw, &prev)
-				toSave = prev
-			}
-			if toSave != nil {
+				// carry forward previous payload unchanged (already migrated to new RID by RotateRefreshAtomic)
+				payloadInfo.Source = "carry-forward"
+				newRaw, newFound, _ := ps.GetRefreshPayloadJSON(ctx, newRC.RID)
+				if newFound {
+					payloadInfo.RawJSON = newRaw
+				}
+			} else if toSave != nil {
+				// Save new override
 				_ = ps.SaveRefreshPayload(ctx, newRC.RID, toSave, rTTL)
+				b, _ := json.Marshal(toSave)
+				payloadInfo.RawJSON = b
 			}
+			res.Payload = payloadInfo
 		}
 		// Update per-user device mapping to the new RID if device info present
 		if rs, ok := p.Store.(DeviceIndexStore); ok {
@@ -268,7 +305,10 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 		}
 	}
 
-	// Return new refresh claims to caller as rc for convenience
-	rc = newRC
+	// Assemble result
+	res.AccessJWE = accessJWE
+	res.RefreshJWE = refreshJWE
+	res.AccessClaims = ac
+	res.RefreshClaims = newRC
 	return
 }

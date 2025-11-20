@@ -433,7 +433,7 @@ func main() {
 			req.Aud = "api://local"
 		}
 
-		acJWE, rfJWE, _, rc, err := tokens.AutoLoginWithRefresh(
+		result, err := tokens.AutoLoginWithRefresh(
 			r.Context(),
 			tokens.WithAutoStore(store),
 			tokens.WithAutoDecryptKey(encPriv),
@@ -449,11 +449,11 @@ func main() {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(autoLoginResp{
-			AccessJWE:  acJWE,
-			RefreshJWE: rfJWE,
-			UID:        rc.UID,
-			DeviceID:   rc.DeviceID,
-			ClientID:   rc.ClientID,
+			AccessJWE:  result.AccessJWE,
+			RefreshJWE: result.RefreshJWE,
+			UID:        result.RefreshClaims.UID,
+			DeviceID:   result.RefreshClaims.DeviceID,
+			ClientID:   result.RefreshClaims.ClientID,
 		})
 	})
 
