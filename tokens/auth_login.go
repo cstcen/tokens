@@ -28,7 +28,7 @@ type AuthLoginParams struct {
 
 	UIDValidator func(context.Context, string) error
 
-	// Optional: refresh extra JSON to cache (not embedded into JWTs).
+	// Optional: refresh extra payload (externalized; not embedded into JWTs).
 	PreSignRefreshExtra map[string]interface{}
 }
 
@@ -42,7 +42,7 @@ func WithAuthIssueOptions(opts ...IssueOption) AuthLoginOption {
 	return func(p *AuthLoginParams) { p.IssueOps = append(p.IssueOps, opts...) }
 }
 
-// WithAuthPreSignRefreshExtra sets extra JSON cached with refresh claims (not embedded).
+// WithAuthPreSignRefreshExtra sets extra payload stored with refresh RID (not embedded).
 func WithAuthPreSignRefreshExtra(extra map[string]interface{}) AuthLoginOption {
 	return func(p *AuthLoginParams) { p.PreSignRefreshExtra = extra }
 }
@@ -114,20 +114,13 @@ func AuthLogin(ctx context.Context, opts ...AuthLoginOption) (res IssueResult) {
 	// Append TTL and call Issue
 	issueOps := append([]IssueOption{}, p.IssueOps...)
 	issueOps = append(issueOps, WithTTL(aTTL, rTTL))
+	// Map refresh extra to payload storage during issuance for atomic write when supported
+	if p.PreSignRefreshExtra != nil {
+		issueOps = append(issueOps, WithRefreshPayload(p.PreSignRefreshExtra))
+	}
 	res = Issue(ctx, p.Store, issueOps...)
 	if res.Err != nil {
 		return res
-	}
-	// Cache refresh claims with Extra JSON to avoid enlarging JWT.
-	if p.Store != nil && p.PreSignRefreshExtra != nil {
-		rc := res.RefreshClaims
-		rc.Extra = p.PreSignRefreshExtra
-		ttl := ttlFromExpiry(rc.Claims.Expiry.Time(), 0)
-		if ttl > 0 {
-			_ = p.Store.CacheRefreshClaims(ctx, res.RefreshJWE, rc, ttl)
-		}
-		// reflect Extra back to result for caller convenience
-		res.RefreshClaims = rc
 	}
 	return res
 }

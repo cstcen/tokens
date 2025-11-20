@@ -40,7 +40,7 @@ type AutoLoginParams struct {
 	// Return ErrUserLoginForbidden (or any error) to block auto login.
 	UIDValidator func(context.Context, string) error
 
-	// Optional: refresh extra fields cached (not embedded) to reduce JWT size.
+	// Optional: refresh extra payload stored via PayloadStore (not embedded).
 	RefreshExtra map[string]interface{}
 }
 
@@ -228,11 +228,11 @@ func AutoLoginWithRefresh(ctx context.Context, opts ...AutoLoginOption) (accessJ
 			newRC.RID, newRC.FID, newRC, rTTL,
 		)
 		if rTTL > 0 {
-			// Attach refresh extra only in cache to avoid enlarging JWT size
-			if p.RefreshExtra != nil {
-				newRC.Extra = p.RefreshExtra
-			}
 			_ = p.Store.CacheRefreshClaims(ctx, refreshJWE, newRC, rTTL)
+		}
+		// Store/replace externalized refresh payload for the new RID, if provided
+		if ps, ok := p.Store.(PayloadStore); ok && p.RefreshExtra != nil {
+			_ = ps.SaveRefreshPayload(ctx, newRC.RID, p.RefreshExtra, rTTL)
 		}
 		// Update per-user device mapping to the new RID if device info present
 		if rs, ok := p.Store.(DeviceIndexStore); ok {
