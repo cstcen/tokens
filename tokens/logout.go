@@ -40,6 +40,9 @@ type LogoutParams struct {
 	ClearDeviceIndex bool
 	// If true, also clear device-wide occupant mapping for deviceID. Default false.
 	ClearDeviceOccupant bool
+	// CascadeDeviceRefresh: when only an access token (or JTI) is provided, also revoke the current device's
+	// active refresh token if DeviceIndexStore is available. Default false.
+	CascadeDeviceRefresh bool
 }
 
 // WithLogoutStore sets the token store used for revocation and optional device index cleanup.
@@ -103,6 +106,11 @@ func WithLogoutClearDeviceOccupant(clear bool) LogoutOption {
 	return func(p *LogoutParams) { p.ClearDeviceOccupant = clear }
 }
 
+// WithLogoutCascadeDeviceRefresh enables revoking the device's refresh token when logging out via access token only.
+func WithLogoutCascadeDeviceRefresh(enable bool) LogoutOption {
+	return func(p *LogoutParams) { p.CascadeDeviceRefresh = enable }
+}
+
 // Logout revokes access/refresh by token or identifiers and optionally clears device mappings.
 //
 // Behavior:
@@ -131,21 +139,40 @@ func Logout(ctx context.Context, opts ...LogoutOption) error {
 	}
 	var firstErr error
 
-	// Access revocation
+	// Access revocation (+ optional cascade to device refresh)
 	if p.AccessToken != "" || p.JTI != "" {
 		jti := p.JTI
+		var ac AccessCustomClaims
+		var acParsed bool
 		if p.AccessToken != "" {
-			if ac, err := DecryptAndVerifyAccess(p.AccessToken, p.EncPrivKey, p.FindSigKeyByKID, p.Iss, p.Aud); err == nil {
+			if parsed, err := DecryptAndVerifyAccess(p.AccessToken, p.EncPrivKey, p.FindSigKeyByKID, p.Iss, p.Aud); err == nil {
+				ac = parsed
+				acParsed = true
 				jti = ac.Claims.ID
 			} else {
-				if firstErr == nil {
-					firstErr = err
-				}
+				firstErr = err
 			}
 		}
 		if jti != "" {
 			if err := p.Store.RevokeAccess(ctx, jti, p.AccessRevokeTTL); err != nil && firstErr == nil {
 				firstErr = err
+			}
+			// Cascade refresh revocation only if enabled and no explicit refresh token/RID was provided
+			if p.CascadeDeviceRefresh && acParsed && p.RefreshToken == "" && p.RID == "" {
+				if rs, ok := p.Store.(DeviceIndexStore); ok && ac.DeviceID != "" && ac.Claims.Subject != "" {
+					if rid, exists, _ := rs.GetDeviceRID(ctx, ac.Claims.Subject, ac.DeviceID); exists && rid != "" {
+						if err := p.Store.RevokeRefresh(ctx, rid, p.RefreshRevokeTTL); err != nil && firstErr == nil {
+							firstErr = err
+						}
+						// Clear device mapping if requested
+						if p.ClearDeviceIndex {
+							_ = rs.DelDeviceRID(ctx, ac.Claims.Subject, ac.DeviceID)
+							if p.ClearDeviceOccupant {
+								_ = rs.DelDeviceOccupant(ctx, ac.DeviceID)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
