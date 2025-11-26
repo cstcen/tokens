@@ -38,6 +38,21 @@ type AutoLoginParams struct {
 	PreSignRefreshExtra map[string]interface{}
 }
 
+// WithAutoLoginDecryptKey sets the private key for JWE decryption of the refresh token.
+func WithAutoLoginDecryptKey(priv interface{}) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.EncPrivKey = priv }
+}
+
+// WithAutoLoginFindSigKey provides the KID->public key resolver used to verify the inner JWS.
+func WithAutoLoginFindSigKey(f func(string) crypto.PublicKey) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.FindSigKeyByKID = f }
+}
+
+// WithAutoLoginAudience sets issuer and audience used to validate the incoming refresh token.
+func WithAutoLoginAudience(iss, aud string) AutoLoginOption {
+	return func(p *AutoLoginParams) { p.Iss = iss; p.Aud = aud }
+}
+
 // WithAutoLoginStore sets the TokenStore to persist and check tokens.
 func WithAutoLoginStore(store TokenStore) AutoLoginOption {
 	return func(p *AutoLoginParams) { p.Store = store }
